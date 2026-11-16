@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e7a5f">
+<title>رسائلي — تطبيق المراسلة</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<!-- شاشة الدخول / التسجيل -->
+<section id="auth-screen" class="screen">
+  <div class="auth-card">
+    <div class="logo">✉️</div>
+    <h1>رسائلي</h1>
+    <p class="sub">مراسلة نصية فقط — بين أي جهازين</p>
+    <div class="tabs">
+      <button id="tab-login" class="tab active" type="button">دخول</button>
+      <button id="tab-register" class="tab" type="button">حساب جديد</button>
+    </div>
+    <form id="auth-form">
+      <input id="auth-username" type="text" placeholder="اسم المستخدم" autocomplete="username" required>
+      <input id="auth-password" type="password" placeholder="كلمة المرور" autocomplete="current-password" required>
+      <button id="auth-submit" type="submit">دخول</button>
+      <p id="auth-error" class="error" hidden></p>
+    </form>
+  </div>
+</section>
+
+<!-- الشاشة الرئيسية -->
+<section id="main-screen" class="screen" hidden>
+  <header class="topbar">
+    <div class="me">👤 <span id="my-name"></span> <span id="conn-dot" class="dot offline" title="الحالة"></span></div>
+    <button id="logout-btn" type="button" class="ghost">خروج</button>
+  </header>
+
+  <nav class="tabs main-tabs">
+    <button id="tab-chats" class="tab active" type="button">المحادثات</button>
+    <button id="tab-people" class="tab" type="button">الأشخاص</button>
+  </nav>
+
+  <div id="view-chats" class="view">
+    <ul id="conversation-list" class="list"></ul>
+    <p id="chats-empty" class="empty">لا محادثات بعد — ابدأ من تبويب «الأشخاص»</p>
+  </div>
+
+  <div id="view-people" class="view" hidden>
+    <input id="people-search" type="search" placeholder="ابحث باسم المستخدم…">
+    <ul id="people-list" class="list"></ul>
+    <p id="people-empty" class="empty" hidden>لا نتائج</p>
+  </div>
+</section>
+
+<!-- شاشة المحادثة -->
+<section id="chat-screen" class="screen" hidden>
+  <header class="topbar">
+    <button id="back-btn" type="button" class="ghost">→ رجوع</button>
+    <div class="chat-title"><span id="chat-name"></span> <span id="chat-presence" class="presence"></span></div>
+  </header>
+  <div id="messages" class="messages"></div>
+  <form id="send-form" class="composer">
+    <input id="message-input" type="text" placeholder="اكتب رسالة…" autocomplete="off">
+    <button type="submit">إرسال</button>
+  </form>
+</section>
+
+<script src="/app.js"></script>
+</body>
+</html>
