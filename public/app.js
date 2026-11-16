@@ -362,10 +362,33 @@ function startCallTimer() {
 }
 
 // ----- اتصال WebRTC -----
+// جودة فيديو عالية للمكالمات المرئية (720p مثالي، حتى 1080p، 30fps)
+const VIDEO_CONSTRAINTS = {
+  width: { ideal: 1280, max: 1920 },
+  height: { ideal: 720, max: 1080 },
+  frameRate: { ideal: 30, max: 30 },
+  facingMode: 'user',
+};
 function setupPeerConnection() {
   const pc = new RTCPeerConnection(ICE_CONFIG);
   call.pc = pc;
   for (const track of call.localStream.getTracks()) pc.addTrack(track, call.localStream);
+  // رفع جودة الإرسال: تلميح «تفاصيل» لمسار الفيديو + حد بت أعلى بدون تصغير للدقة
+  const localVideoTrack = call.localStream.getVideoTracks()[0];
+  if (localVideoTrack) { try { localVideoTrack.contentHint = 'detail'; } catch {} }
+  if (call.type === 'video') {
+    for (const sender of pc.getSenders()) {
+      if (sender.track && sender.track.kind === 'video') {
+        try {
+          const params = sender.getParameters() || {};
+          const existing = (params.encodings && params.encodings[0]) || {};
+          params.encodings = [{ ...existing, maxBitrate: 2500000, maxFramerate: 30, scaleResolutionDownBy: 1 }];
+          const p = sender.setParameters(params);
+          if (p && p.catch) p.catch(() => {});
+        } catch {}
+      }
+    }
+  }
   if (call.type === 'video') $('local-video').srcObject = call.localStream;
   pc.onicecandidate = (e) => {
     if (e.candidate && call) callSend({ type: 'call_ice', to: call.peer, candidate: e.candidate.toJSON() });
@@ -397,7 +420,7 @@ async function startCall(type) {
   const peer = currentChat;
   let stream;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: type === 'video' });
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: type === 'video' ? VIDEO_CONSTRAINTS : false });
   } catch {
     alert('تعذّر الوصول إلى ' + (type === 'video' ? 'الكاميرا والميكروفون' : 'الميكروفون') + '. تحقّق من أذونات المتصفح ثم حاول مرة أخرى.');
     return;
@@ -498,7 +521,7 @@ $('call-accept').onclick = async () => {
   if (call.ringTimeout) clearTimeout(call.ringTimeout);
   let stream;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: call.type === 'video' });
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: call.type === 'video' ? VIDEO_CONSTRAINTS : false });
   } catch {
     callSend({ type: 'call_reject', to: call.peer });
     $('call-error').textContent = 'تعذّر الوصول إلى الميكروفون/الكاميرا — أُنهيت المكالمة. تحقّق من أذونات المتصفح.';
