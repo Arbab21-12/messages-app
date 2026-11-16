@@ -16,7 +16,7 @@
   <div class="auth-card">
     <div class="logo">✉️</div>
     <h1>رسائلي</h1>
-    <p class="sub">مراسلة نصية فقط — بين أي جهازين</p>
+    <p class="sub">رسائل ومكالمات — بين أي جهازين</p>
     <div class="tabs">
       <button id="tab-login" class="tab active" type="button">دخول</button>
       <button id="tab-register" class="tab" type="button">حساب جديد</button>
@@ -59,6 +59,10 @@
   <header class="topbar">
     <button id="back-btn" type="button" class="ghost">→ رجوع</button>
     <div class="chat-title"><span id="chat-name"></span> <span id="chat-presence" class="presence"></span></div>
+    <div class="chat-actions">
+      <button id="call-voice-btn" type="button" class="icon-btn" title="مكالمة صوتية">📞</button>
+      <button id="call-video-btn" type="button" class="icon-btn" title="مكالمة فيديو">📹</button>
+    </div>
   </header>
   <div id="messages" class="messages"></div>
   <form id="send-form" class="composer">
@@ -66,6 +70,30 @@
     <button type="submit">إرسال</button>
   </form>
 </section>
+
+<!-- واجهة المكالمة (صادرة / واردة / جارية) -->
+<div id="call-overlay" class="call-overlay" hidden>
+  <video id="remote-video" autoplay playsinline hidden></video>
+  <video id="local-video" autoplay playsinline muted hidden></video>
+  <div class="call-info">
+    <div id="call-avatar" class="call-avatar">؟</div>
+    <div id="call-peer-name" class="call-peer-name"></div>
+    <div id="call-status" class="call-status"></div>
+  </div>
+  <p id="call-error" class="error" hidden></p>
+  <div id="call-incoming-actions" class="call-actions" hidden>
+    <button id="call-accept" type="button" class="call-btn accept">📞 قبول</button>
+    <button id="call-reject" type="button" class="call-btn reject">رفض</button>
+  </div>
+  <div id="call-outgoing-actions" class="call-actions" hidden>
+    <button id="call-cancel" type="button" class="call-btn reject">إلغاء المكالمة</button>
+  </div>
+  <div id="call-controls" class="call-actions" hidden>
+    <button id="call-mute" type="button" class="call-btn ctrl">🎤 كتم</button>
+    <button id="call-camera" type="button" class="call-btn ctrl">📷 الكاميرا</button>
+    <button id="call-end" type="button" class="call-btn reject">📵 إنهاء</button>
+  </div>
+</div>
 
 <script src="/app.js"></script>
 </body>
