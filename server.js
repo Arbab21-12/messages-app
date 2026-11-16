@@ -40,6 +40,7 @@ function publicMessage(m) {
     from: from ? from.username : null,
     to: to ? to.username : null,
     text: m.text,
+    kind: m.kind || 'text',
     ts: m.ts,
     deliveredAt: m.deliveredAt || null,
     readAt: m.readAt || null,
@@ -212,6 +213,144 @@ function deliverMessage(fromUser, toUser, text) {
   return msg;
 }
 
+// ---------- إشارات المكالمات (WebRTC Signaling) ----------
+// الخادم يمرّر رسائل الإشارة بين الطرفين المعنيين فقط، ولا يخزّن SDP/ICE أبداً.
+// الصوت/الفيديو نفسه ينتقل مباشرة بين المتصفحين (Peer-to-Peer) عبر WebRTC.
+const activeCalls = new Map(); // callId -> { id, callerId, calleeId, callType, state, connectedAt, logged }
+const callByUser = new Map(); // userId -> callId
+let callSeq = 0;
+
+function fmtDuration(totalSec) {
+  const sec = Math.max(0, Math.floor(Number(totalSec) || 0));
+  return String(Math.floor(sec / 60)).padStart(2, '0') + ':' + String(sec % 60).padStart(2, '0');
+}
+function callLabel(callType) {
+  return callType === 'video' ? '📹 مكالمة فيديو' : '📞 مكالمة صوتية';
+}
+function getCallBetween(aId, bId) {
+  const id = callByUser.get(aId);
+  if (!id) return null;
+  const call = activeCalls.get(id);
+  return call && (call.callerId === bId || call.calleeId === bId) ? call : null;
+}
+function clearCallState(call) {
+  activeCalls.delete(call.id);
+  if (callByUser.get(call.callerId) === call.id) callByUser.delete(call.callerId);
+  if (callByUser.get(call.calleeId) === call.id) callByUser.delete(call.calleeId);
+}
+/** كتابة سجل مكالمة (kind: 'call') في سجل المحادثة — مرة واحدة فقط لكل مكالمة. */
+function logCallRecord(call, text) {
+  if (call.logged) return;
+  call.logged = true;
+  const from = store.getUserById(call.callerId);
+  const to = store.getUserById(call.calleeId);
+  if (!from || !to) return;
+  const msg = {
+    id: crypto.randomUUID(),
+    fromId: from.id,
+    toId: to.id,
+    text,
+    kind: 'call',
+    ts: Date.now(),
+    deliveredAt: null,
+    readAt: null,
+  };
+  store.addMessage(msg);
+  const delivered = sendToUser(to.id, { type: 'message', message: publicMessage(msg) });
+  if (delivered > 0) store.markDelivered(msg);
+  sendToUser(from.id, { type: 'message', message: publicMessage(msg) });
+}
+
+/** معالجة رسائل إشارة المكالمة الواردة من مستخدم موثّق. */
+function handleCallSignal(ws, me, data) {
+  if (data.type === 'call_invite') {
+    const callType = data.callType === 'video' ? 'video' : 'voice';
+    const to = data.to ? store.getUserByUsername(String(data.to)) : null;
+    if (!to || to.id === me.id) {
+      wsSend(ws, { type: 'call_unavailable', with: data.to || null });
+      return;
+    }
+    if (callByUser.has(me.id)) return; // المتصل نفسه في مكالمة أصلاً — تجاهل
+    const calleeOnline = connections.has(to.id) && connections.get(to.id).size > 0;
+    if (!calleeOnline) {
+      wsSend(ws, { type: 'call_unavailable', with: to.username });
+      logCallRecord(
+        { callerId: me.id, calleeId: to.id, callType, logged: false },
+        callLabel(callType) + ' فائتة'
+      );
+      return;
+    }
+    if (callByUser.has(to.id)) {
+      wsSend(ws, { type: 'call_busy', with: to.username });
+      return;
+    }
+    const call = {
+      id: `call-${++callSeq}-${Date.now()}`,
+      callerId: me.id,
+      calleeId: to.id,
+      callType,
+      state: 'ringing',
+      connectedAt: null,
+      logged: false,
+    };
+    activeCalls.set(call.id, call);
+    callByUser.set(me.id, call.id);
+    callByUser.set(to.id, call.id);
+    sendToUser(to.id, { type: 'call_invite', from: me.username, callType });
+    return;
+  }
+
+  if (
+    data.type === 'call_accept' || data.type === 'call_reject' ||
+    data.type === 'call_end' || data.type === 'call_offer' ||
+    data.type === 'call_answer' || data.type === 'call_ice'
+  ) {
+    const to = data.to ? store.getUserByUsername(String(data.to)) : null;
+    if (!to) return;
+    const call = getCallBetween(me.id, to.id);
+    if (!call) {
+      // لا مكالمة نشطة (أُنهيت من الطرف الآخر مثلاً) — مرّر الإنهاء فقط ليغلق الطرف الآخر واجهته
+      if (data.type === 'call_end') sendToUser(to.id, { type: 'call_end', from: me.username });
+      return;
+    }
+    const otherId = call.callerId === me.id ? call.calleeId : call.callerId;
+
+    if (data.type === 'call_accept') {
+      if (call.calleeId === me.id && call.state === 'ringing') {
+        call.state = 'connected';
+        call.connectedAt = Date.now();
+        sendToUser(call.callerId, { type: 'call_accept', from: me.username });
+      }
+    } else if (data.type === 'call_reject') {
+      const text = call.calleeId === me.id
+        ? callLabel(call.callType) + ' مرفوضة'
+        : callLabel(call.callType) + ' فائتة';
+      logCallRecord(call, text);
+      sendToUser(otherId, { type: 'call_reject', from: me.username });
+      clearCallState(call);
+    } else if (data.type === 'call_end') {
+      let text;
+      if (call.state === 'connected') {
+        const dur = typeof data.duration === 'number'
+          ? data.duration
+          : Math.round((Date.now() - call.connectedAt) / 1000);
+        text = `${callLabel(call.callType)} — ${fmtDuration(dur)}`;
+      } else {
+        text = callLabel(call.callType) + ' فائتة';
+      }
+      logCallRecord(call, text);
+      sendToUser(otherId, { type: 'call_end', from: me.username });
+      clearCallState(call);
+    } else {
+      // call_offer / call_answer / call_ice — تمرير فقط بين الطرفين، دون أي تخزين
+      const out = { type: data.type, from: me.username };
+      if (data.type === 'call_ice') out.candidate = data.candidate;
+      else out.sdp = data.sdp;
+      sendToUser(otherId, out);
+    }
+  }
+}
+
 wss.on('connection', (ws) => {
   ws.isAuthed = false;
   ws.userId = null;
@@ -264,13 +403,33 @@ wss.on('connection', (ws) => {
       const changed = store.markConversationRead(me.id, other.id);
       if (changed.length) notifyReadReceipt(other.id, me.username, changed.map((m) => m.id));
     }
+
+    // إشارات المكالمات (call_invite / call_accept / call_reject / call_offer / call_answer / call_ice / call_end)
+    if (typeof data.type === 'string' && data.type.startsWith('call_')) {
+      handleCallSignal(ws, me, data);
+    }
   });
 
   ws.on('close', () => {
     clearTimeout(authTimeout);
     if (ws.userId && connections.has(ws.userId)) {
       connections.get(ws.userId).delete(ws);
-      if (connections.get(ws.userId).size === 0) connections.delete(ws.userId);
+      if (connections.get(ws.userId).size === 0) {
+        connections.delete(ws.userId);
+        // انقطع اتصاله نهائياً وهو في مكالمة: سجّل المكالمة وأنهِها عند الطرف الآخر
+        const callId = callByUser.get(ws.userId);
+        const call = callId ? activeCalls.get(callId) : null;
+        if (call) {
+          const goneUser = store.getUserById(ws.userId);
+          const otherId = call.callerId === ws.userId ? call.calleeId : call.callerId;
+          const text = call.state === 'connected'
+            ? `${callLabel(call.callType)} — ${fmtDuration(Math.round((Date.now() - call.connectedAt) / 1000))}`
+            : callLabel(call.callType) + ' فائتة';
+          logCallRecord(call, text);
+          sendToUser(otherId, { type: 'call_end', from: goneUser ? goneUser.username : null });
+          clearCallState(call);
+        }
+      }
       broadcastPresence();
     }
   });
