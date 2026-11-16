@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: messages-app
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATA_DIR
+        value: ./data
+    # ملاحظة: Render يضبط PORT تلقائياً — لا تضبطه يدوياً.
+    # الخطة المجانية: الخادم ينام بعد 15 دقيقة خمول، ونظام الملفات مؤقت
+    # (تُمسح البيانات عند إعادة التشغيل). للاستمرارية: خطة مدفوعة + قرص دائم
+    # أو قاعدة بيانات Postgres — راجع README.md

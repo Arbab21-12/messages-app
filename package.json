@@ -1,0 +1,1 @@
+{"dependencies":{"express":"^4.19.2","ws":"^8.18.0"},"description":"تطبيق رسائل فقط — خادم Node.js + واجهة ويب عربية (رسائل بين أجهزة مختلفة)","engines":{"node":">=18"},"main":"server.js","name":"messages-app-server","scripts":{"start":"node server.js","test":"node test/e2e.mjs"},"version":"1.0.0"}
