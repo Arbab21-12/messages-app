@@ -31,9 +31,38 @@ function ticks(m) {
   return '<span class="ticks">✓ أُرسلت</span>';
 }
 
+// ---------- الصور الشخصية ----------
+// ذاكرة مؤقتة: اسم المستخدم -> رابط صورته (تُملأ من القوائم والملف الشخصي ودعوات المكالمات)
+const avatarCache = new Map();
+function noteAvatar(username, avatar) {
+  if (username && avatar) avatarCache.set(username, avatar);
+}
+function avatarFor(username) {
+  return avatarCache.get(username) || null;
+}
+/** محتوى دائرة الصورة: <img> عند وجود صورة، وإلا الحرف الأول من الاسم. */
+function setAvatarEl(el, username, avatar) {
+  if (!el) return;
+  const url = avatar || avatarFor(username);
+  if (url) {
+    el.innerHTML = '';
+    const img = document.createElement('img');
+    img.src = url;
+    img.alt = '';
+    el.appendChild(img);
+  } else {
+    el.textContent = (username && username[0]) || '؟';
+  }
+}
+function avatarHtml(username, avatar, cls = 'avatar') {
+  const url = avatar || avatarFor(username);
+  const inner = url ? `<img src="${url}" alt="">` : escapeHtml((username && username[0]) || '؟');
+  return `<div class="${cls}">${inner}</div>`;
+}
+
 // ---------- الدخول ----------
 // قواعد الحساب الجديد — مرآة لقواعد الخادم (التحقق النهائي دائماً عند الخادم)
-const USERNAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{2,23}$/;
+const USERNAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,23}$/;
 const USERNAME_ERROR = 'اسم المستخدم يجب أن يبدأ بحرف أو رقم، ويمكن أن يحتوي على حروف وأرقام و _ . - فقط';
 function passwordMissing(pw) {
   const missing = [];
@@ -111,6 +140,8 @@ $('logout-btn').onclick = async () => {
 // ---------- الدخول للتطبيق ----------
 async function enterApp() {
   $('my-name').textContent = me.username;
+  noteAvatar(me.username, me.avatar);
+  setAvatarEl($('my-avatar'), me.username, me.avatar);
   show('main-screen');
   connectWs();
   await loadConversations();
@@ -183,14 +214,15 @@ async function loadConversations() {
   for (const c of conversations) {
     const li = document.createElement('li');
     const last = c.lastMessage;
+    noteAvatar(c.username, c.avatar);
     li.innerHTML = `
-      <div class="avatar">${escapeHtml(c.username[0] || '؟')}</div>
+      ${avatarHtml(c.username, c.avatar)}
       <div class="row-main">
         <div class="row-title"><span>${escapeHtml(c.username)}</span><time>${last ? fmtTime(last.ts) : ''}</time></div>
         <div class="row-sub">${escapeHtml(previewText(last))}</div>
       </div>
       ${c.unread ? `<span class="badge">${c.unread}</span>` : ''}`;
-    li.onclick = () => openChat(c.username);
+    li.onclick = () => openChat(c.username, c.avatar);
     list.appendChild(li);
   }
 }
@@ -205,13 +237,14 @@ async function loadPeople(q = '') {
   for (const u of users) {
     const on = onlineUsers.has(u.username);
     const li = document.createElement('li');
+    noteAvatar(u.username, u.avatar);
     li.innerHTML = `
-      <div class="avatar">${escapeHtml(u.username[0] || '؟')}</div>
+      ${avatarHtml(u.username, u.avatar)}
       <div class="row-main">
         <div class="row-title"><span>${escapeHtml(u.username)}</span></div>
         <div class="row-sub">${on ? 'متصل الآن' : 'غير متصل'}</div>
       </div>`;
-    li.onclick = () => openChat(u.username);
+    li.onclick = () => openChat(u.username, u.avatar);
     list.appendChild(li);
   }
 }
@@ -229,9 +262,11 @@ $('tab-chats').onclick = () => setMainTab('chats');
 $('tab-people').onclick = () => setMainTab('people');
 
 // ---------- المحادثة ----------
-async function openChat(username) {
+async function openChat(username, avatar) {
   currentChat = username;
+  noteAvatar(username, avatar);
   $('chat-name').textContent = username;
+  setAvatarEl($('chat-avatar'), username, avatar);
   updatePresenceUI();
   show('chat-screen');
   $('messages').innerHTML = '';
@@ -688,7 +723,7 @@ function showCallOverlay(mode) {
   const isVideo = call.type === 'video';
   $('call-overlay').hidden = false;
   $('call-peer-name').textContent = call.peer;
-  $('call-avatar').textContent = call.peer[0] || '؟';
+  setAvatarEl($('call-avatar'), call.peer, call.avatar);
   $('call-avatar').hidden = isVideo;
   $('remote-video').hidden = !(isVideo && mode === 'active');
   $('local-video').hidden = !isVideo;
@@ -823,6 +858,7 @@ async function startCall(type) {
     pc: null, localStream: stream, connectedAt: null, acceptedAt: null,
     timer: null, ringTimeout: null, pendingIce: [],
     speaker: type === 'video', // الفيديو: مكبر صوت افتراضياً — الصوتية: سماعة الهاتف
+    avatar: avatarFor(peer),
   };
   setupPeerConnection();
   showCallOverlay('outgoing');
@@ -842,12 +878,14 @@ function handleCallEvent(data) {
   switch (data.type) {
     case 'call_invite': {
       if (call) return; // مشغول محلياً أصلاً
+      noteAvatar(data.from, data.avatar);
       call = {
         peer: data.from, type: data.callType === 'video' ? 'video' : 'voice',
         role: 'callee', status: 'incoming',
         pc: null, localStream: null, connectedAt: null, acceptedAt: null,
         timer: null, ringTimeout: null, pendingIce: [],
         speaker: data.callType === 'video',
+        avatar: data.avatar || avatarFor(data.from),
       };
       showCallOverlay('incoming');
       startRingtone();
@@ -1009,6 +1047,78 @@ $('call-speaker').onclick = () => {
   updateSpeakerBtn();
   applyAudioOutput(true);
 };
+
+// ---------- الملف الشخصي: الصورة الشخصية + تغيير اسم المستخدم ----------
+function openProfile() {
+  if (!me) return;
+  $('profile-name').textContent = me.username;
+  setAvatarEl($('profile-avatar'), me.username, me.avatar);
+  $('new-username').value = '';
+  $('profile-error').hidden = true;
+  $('profile-ok').hidden = true;
+  $('profile-panel').hidden = false;
+}
+function closeProfile() { $('profile-panel').hidden = true; }
+$('my-profile-btn').onclick = openProfile;
+$('profile-close').onclick = closeProfile;
+$('profile-panel').addEventListener('click', (e) => { if (e.target === $('profile-panel')) closeProfile(); });
+
+function refreshMyIdentity() {
+  // بعد تغيير الصورة أو الاسم: حدّث الترويسة واللوحة والقوائم دون إعادة دخول
+  $('my-name').textContent = me.username;
+  setAvatarEl($('my-avatar'), me.username, me.avatar);
+  $('profile-name').textContent = me.username;
+  setAvatarEl($('profile-avatar'), me.username, me.avatar);
+  loadConversations();
+  if (!$('view-people').hidden) loadPeople($('people-search').value.trim());
+}
+
+$('avatar-change-btn').onclick = () => { if (!uploading) $('avatar-input').click(); };
+$('avatar-input').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file) return;
+  $('profile-error').hidden = true;
+  $('profile-ok').hidden = true;
+  try {
+    const up = await uploadFile(file, file.name || 'avatar');
+    const data = await api('/api/me/avatar', { method: 'POST', body: JSON.stringify({ fileId: up.fileId }) });
+    me = data.user;
+    noteAvatar(me.username, me.avatar);
+    refreshMyIdentity();
+    $('profile-ok').textContent = 'تم تحديث الصورة الشخصية';
+    $('profile-ok').hidden = false;
+  } catch (err) {
+    $('profile-error').textContent = err.message || 'فشل تحديث الصورة';
+    $('profile-error').hidden = false;
+  }
+});
+
+$('username-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const name = $('new-username').value.trim();
+  $('profile-error').hidden = true;
+  $('profile-ok').hidden = true;
+  if (!USERNAME_RE.test(name)) {
+    $('profile-error').textContent = USERNAME_ERROR;
+    $('profile-error').hidden = false;
+    return;
+  }
+  try {
+    const data = await api('/api/me/username', { method: 'POST', body: JSON.stringify({ username: name }) });
+    const oldName = me.username;
+    me = data.user;
+    if (oldName !== me.username) avatarCache.delete(oldName);
+    noteAvatar(me.username, me.avatar);
+    refreshMyIdentity();
+    $('profile-ok').textContent = 'تم تغيير اسم المستخدم إلى «' + me.username + '»';
+    $('profile-ok').hidden = false;
+    $('new-username').value = '';
+  } catch (err) {
+    $('profile-error').textContent = err.message || 'فشل تغيير الاسم';
+    $('profile-error').hidden = false;
+  }
+});
 
 // ---------- إقلاع ----------
 (async () => {

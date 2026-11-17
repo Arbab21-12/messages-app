@@ -25,7 +25,7 @@
       <input id="auth-username" type="text" placeholder="اسم المستخدم" autocomplete="username" required>
       <input id="auth-password" type="password" placeholder="كلمة المرور" autocomplete="current-password" required>
       <div id="reg-hints" hidden>
-        <p class="hint" id="username-hint">اسم المستخدم: يبدأ بحرف أو رقم، ويمكن أن يحتوي على حروف وأرقام و _ . - (من ٣ إلى ٢٤ حرفاً)</p>
+        <p class="hint" id="username-hint">اسم المستخدم: من حرف واحد حتى ٢٤ حرفاً، يبدأ بحرف أو رقم، ويمكن أن يحتوي على حروف وأرقام و _ . -</p>
         <ul class="pw-checklist" id="pw-checklist">
           <li id="pw-chk-letters"><span class="chk-mark">•</span> ٤ حروف على الأقل</li>
           <li id="pw-chk-digit"><span class="chk-mark">•</span> رقم واحد على الأقل</li>
@@ -41,7 +41,11 @@
 <!-- الشاشة الرئيسية -->
 <section id="main-screen" class="screen" hidden>
   <header class="topbar">
-    <div class="me">👤 <span id="my-name"></span> <span id="conn-dot" class="dot offline" title="الحالة"></span></div>
+    <button id="my-profile-btn" type="button" class="me-btn" title="الملف الشخصي">
+      <span id="my-avatar" class="avatar avatar-sm"></span>
+      <span id="my-name"></span>
+      <span id="conn-dot" class="dot offline" title="الحالة"></span>
+    </button>
     <button id="logout-btn" type="button" class="ghost">خروج</button>
   </header>
 
@@ -66,7 +70,7 @@
 <section id="chat-screen" class="screen" hidden>
   <header class="topbar">
     <button id="back-btn" type="button" class="ghost">→ رجوع</button>
-    <div class="chat-title"><span id="chat-name"></span> <span id="chat-presence" class="presence"></span></div>
+    <div class="chat-title"><span id="chat-avatar" class="avatar avatar-sm"></span><span id="chat-name"></span> <span id="chat-presence" class="presence"></span></div>
     <div class="chat-actions">
       <button id="call-voice-btn" type="button" class="icon-btn" title="مكالمة صوتية">📞</button>
       <button id="call-video-btn" type="button" class="icon-btn" title="مكالمة فيديو">📹</button>
@@ -90,6 +94,27 @@
   </div>
   <div id="upload-status" class="upload-status" hidden>جارٍ الرفع…</div>
 </section>
+
+<!-- لوحة الملف الشخصي: الصورة الشخصية + تغيير اسم المستخدم -->
+<div id="profile-panel" class="profile-panel" hidden>
+  <div class="profile-card">
+    <button id="profile-close" type="button" class="ghost profile-x" title="إغلاق">✕</button>
+    <div id="profile-avatar" class="avatar avatar-lg"></div>
+    <div id="profile-name" class="profile-name"></div>
+    <button id="avatar-change-btn" type="button" class="ghost">تغيير الصورة الشخصية</button>
+    <input id="avatar-input" type="file" accept="image/*" hidden>
+    <hr class="profile-sep">
+    <form id="username-form">
+      <label for="new-username" class="profile-label">تغيير اسم المستخدم</label>
+      <input id="new-username" type="text" placeholder="اسم المستخدم الجديد" autocomplete="off">
+      <p class="hint">من حرف واحد حتى ٢٤ حرفاً، يبدأ بحرف أو رقم</p>
+      <p class="hint warn">تنبيه: اسمك القديم يبقى محجوزاً لك ٣ أيام (يمكنك الرجوع إليه)، وبعدها يستطيع أي شخص أخذه</p>
+      <button type="submit">حفظ الاسم الجديد</button>
+      <p id="profile-error" class="error" hidden></p>
+      <p id="profile-ok" class="ok" hidden></p>
+    </form>
+  </div>
+</div>
 
 <!-- قائمة حذف الرسالة (ضغط مطوّل أو نقر يمين على الفقاعة) -->
 <div id="msg-menu" class="msg-menu" hidden>
