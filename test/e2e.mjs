@@ -192,6 +192,78 @@ try {
   const carolRecs = (histCarol.data.messages || []).filter((m) => m.kind === 'call');
   check('سجل مكالمة فائتة محفوظ في محادثة carol_test', carolRecs.length === 1 && carolRecs[0].text.includes('فائتة'), `count=${carolRecs.length}`);
 
+  // 10) رفع الملفات + رسائل الوسائط + حذف الرسائل
+  const uploadRaw = async (bytes, { token, mime, name = 'file' } = {}) => {
+    const res = await fetch(BASE + '/api/upload', {
+      method: 'POST',
+      headers: { ...(token ? { Authorization: 'Bearer ' + token } : {}), 'Content-Type': mime, 'X-File-Name': name },
+      body: bytes,
+    });
+    return { status: res.status, data: await res.json().catch(() => ({})) };
+  };
+  const getFileRaw = async (url) => {
+    const res = await fetch(BASE + url);
+    return { status: res.status, buf: Buffer.from(await res.arrayBuffer()), type: res.headers.get('content-type') || '' };
+  };
+  const tokB2 = loginB2.data.token;
+  const PNG_BYTES = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8Xw8AAwMCAO+ip1sAAAAASUVORK5CYII=', 'base64');
+
+  const upNoAuth = await uploadRaw(PNG_BYTES, { mime: 'image/png', name: 'x.png' });
+  check('الرفع بدون مصادقة يُرفض 401', upNoAuth.status === 401, `status=${upNoAuth.status}`);
+  const upBadMime = await uploadRaw(Buffer.from('<html>hi</html>'), { token: tokA, mime: 'text/html', name: 'x.html' });
+  check('الرفع بنوع MIME غير مسموح يُرفض 400', upBadMime.status === 400, `status=${upBadMime.status}`);
+  const upPng = await uploadRaw(PNG_BYTES, { token: tokA, mime: 'image/png', name: 'pixel.png' });
+  check('رفع PNG ناجح ويعيد fileId', upPng.status === 201 && !!upPng.data.fileId, `status=${upPng.status}`);
+  const gotFile = await getFileRaw('/files/' + upPng.data.fileId);
+  check('GET /files يعيد نفس البايتات ونوع المحتوى الصحيح',
+    gotFile.status === 200 && gotFile.buf.equals(PNG_BYTES) && gotFile.type.includes('image/png'),
+    `status=${gotFile.status} type=${gotFile.type}`);
+
+  // رسالة صورة لحظياً عبر WebSocket
+  A.send({ type: 'send', to: 'sara_test', kind: 'image', fileId: upPng.data.fileId });
+  const imgLive = await B2.waitFor((m) => m.type === 'message' && m.message.kind === 'image').catch(() => null);
+  check('B يستلم رسالة الصورة لحظياً (kind=image + fileId)', !!imgLive && imgLive.message.fileId === upPng.data.fileId);
+  await wait(200);
+  const histImgB = await api('/api/messages/omar_test', { token: tokB2 });
+  check('سجل B يحتوي رسالة الصورة', histImgB.data.messages?.some((m) => m.kind === 'image' && m.fileId === upPng.data.fileId));
+
+  // رسالة صوتية: رفع + إرسال عبر REST بنفس مسار الوسائط
+  const upVoice = await uploadRaw(Buffer.from('FAKE_WEBM_AUDIO_BYTES'), { token: tokA, mime: 'audio/webm', name: 'voice.webm' });
+  check('رفع ملف صوتي ناجح', upVoice.status === 201 && !!upVoice.data.fileId, `status=${upVoice.status}`);
+  const voiceMsg = await api('/api/messages/sara_test', { method: 'POST', token: tokA, body: { kind: 'voice', fileId: upVoice.data.fileId, durationSec: 7 } });
+  check('إرسال رسالة صوتية (REST) بنوع voice والمدة 7',
+    voiceMsg.status === 201 && voiceMsg.data.message?.kind === 'voice' && voiceMsg.data.message?.durationSec === 7,
+    `status=${voiceMsg.status}`);
+
+  // حذف لدى الجميع: غير المرسل يُرفض 403 — المرسل ينجح — B يستلم الحدث ويرى النص البديل
+  A.send({ type: 'send', to: 'sara_test', text: 'رسالة اختبار الحذف للجميع' });
+  const delTarget = await B2.waitFor((m) => m.type === 'message' && m.message.text.includes('اختبار الحذف للجميع')).catch(() => null);
+  check('B استلم رسالة اختبار الحذف', !!delTarget);
+  const delId = delTarget?.message?.id;
+  const delByB = await api('/api/messages/' + delId, { method: 'DELETE', token: tokB2, body: { scope: 'everyone' } });
+  check('حذف لدى الجميع من غير المرسل يُرفض 403', delByB.status === 403, `status=${delByB.status}`);
+  const delByA = await api('/api/messages/' + delId, { method: 'DELETE', token: tokA, body: { scope: 'everyone' } });
+  check('المرسل يحذف رسالته لدى الجميع (200)', delByA.status === 200, `status=${delByA.status}`);
+  const delEvent = await B2.waitFor((m) => m.type === 'message_deleted' && m.id === delId && m.scope === 'everyone').catch(() => null);
+  check('B يستلم حدث message_deleted', !!delEvent);
+  await wait(200);
+  const histDelB = await api('/api/messages/omar_test', { token: tokB2 });
+  const tomb = histDelB.data.messages?.find((m) => m.id === delId);
+  check('سجل B يعرض النص البديل (deleted وبدون نص)', !!tomb && tomb.deleted === true && !tomb.text, JSON.stringify(tomb || {}));
+
+  // حذف لديّ: تختفي من سجل B وتبقى عند A
+  A.send({ type: 'send', to: 'sara_test', text: 'رسالة للحذف لدى المستلم فقط' });
+  const meTarget = await B2.waitFor((m) => m.type === 'message' && m.message.text.includes('للحذف لدى المستلم فقط')).catch(() => null);
+  check('B استلم رسالة الحذف الشخصي', !!meTarget);
+  const meId = meTarget?.message?.id;
+  const delMe = await api('/api/messages/' + meId, { method: 'DELETE', token: tokB2, body: { scope: 'me' } });
+  check('B يحذف الرسالة لديه فقط (200)', delMe.status === 200, `status=${delMe.status}`);
+  await wait(200);
+  const histMeB = await api('/api/messages/omar_test', { token: tokB2 });
+  check('الرسالة اختفت من سجل B', !histMeB.data.messages?.some((m) => m.id === meId));
+  const histMeA = await api('/api/messages/sara_test', { token: tokA });
+  check('الرسالة ما زالت في سجل A', histMeA.data.messages?.some((m) => m.id === meId));
+
   B2.close();
   A.close();
 } catch (err) {
