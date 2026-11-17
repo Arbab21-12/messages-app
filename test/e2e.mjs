@@ -13,7 +13,9 @@
 // خادم ثانٍ بلا أي إعداد بريد، وإرسال Brevo عبر HTTPS API على خادم ثالث
 // يقصده خادم HTTP وهمي محلي (حمولة الطلب كاملة + مسار فشل عند ردّ 400)،
 // وإرسال Mailjet عبر HTTPS API على خادم رابع يقصده وهمي محلي آخر (ترويسة
-// مصادقة Basic وحمولة Messages + مسار فشل عند ردّ 401).
+// مصادقة Basic وحمولة Messages + مسار فشل عند ردّ 401)، وإرسال SMTP2GO عبر
+// HTTPS API على خادم خامس يقصده وهمي محلي ثالث (ترويسة X-Smtp2go-Api-Key
+// وحمولة sender/to/text_body + مسار فشل عند ردّ 400).
 // التشغيل: npm test
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -82,7 +84,7 @@ function startServer(extraEnv = {}) {
   s.stderr.on('data', (d) => process.stderr.write('[server] ' + d));
   return s;
 }
-let server = startServer({ ADMIN_USERNAME: 'admin_test', MAIL_OUTBOX: outboxPath });
+let server = startServer({ ADMIN_USERNAME: 'admin_test', MAIL_OUTBOX: outboxPath, SMTP2GO_API_KEY: '' });
 
 // صندوق الصادر (MAIL_OUTBOX): سطر JSON لكل رسالة — تُستخرج منه رموز التأكيد
 function readOutbox() {
@@ -606,7 +608,7 @@ try {
   const dataDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'msgtest-nomail-'));
   const server2 = spawn('node', ['server.js'], {
     cwd: root,
-    env: { ...process.env, PORT: '3220', DATA_DIR: dataDir2, MAIL_OUTBOX: '', SMTP_USER: '', SMTP_PASS: '', ADMIN_USERNAME: '', BREVO_API_KEY: '', MAILJET_API_KEY: '', MAILJET_API_SECRET: '' },
+    env: { ...process.env, PORT: '3220', DATA_DIR: dataDir2, MAIL_OUTBOX: '', SMTP_USER: '', SMTP_PASS: '', ADMIN_USERNAME: '', BREVO_API_KEY: '', MAILJET_API_KEY: '', MAILJET_API_SECRET: '', SMTP2GO_API_KEY: '' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   server2.stderr.on('data', (d) => process.stderr.write('[server2] ' + d));
@@ -664,7 +666,7 @@ try {
     env: {
       ...process.env, PORT: '3221', DATA_DIR: dataDir3,
       MAIL_OUTBOX: '', SMTP_USER: '', SMTP_PASS: '', ADMIN_USERNAME: '',
-      MAILJET_API_KEY: '', MAILJET_API_SECRET: '',
+      MAILJET_API_KEY: '', MAILJET_API_SECRET: '', SMTP2GO_API_KEY: '',
       BREVO_API_KEY: 'test-key-123', MAIL_FROM: 'sender@test.dev', BREVO_API_URL: brevoMockUrl,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -755,7 +757,7 @@ try {
     cwd: root,
     env: {
       ...process.env, PORT: '3222', DATA_DIR: dataDir4,
-      MAIL_OUTBOX: '', SMTP_USER: '', SMTP_PASS: '', ADMIN_USERNAME: '', BREVO_API_KEY: '',
+      MAIL_OUTBOX: '', SMTP_USER: '', SMTP_PASS: '', ADMIN_USERNAME: '', BREVO_API_KEY: '', SMTP2GO_API_KEY: '',
       MAILJET_API_KEY: 'mj-key-123', MAILJET_API_SECRET: 'mj-secret-456',
       MAIL_FROM: 'sender@test.dev', MAILJET_API_URL: mjMockUrl,
     },
@@ -819,6 +821,98 @@ try {
     server4.kill();
     mjMock.close();
     fs.rmSync(dataDir4, { recursive: true, force: true });
+  }
+
+  // 20) إرسال SMTP2GO عبر HTTPS API: خادم خامس بـ SMTP2GO_API_KEY وبلا صندوق
+  // صادر وبلا Mailjet وبلا Brevo وبلا SMTP، يقصد خادم HTTP وهمياً محلياً يحاكي
+  // SMTP2GO (يسجّل الطلبات ويردّ 200 بـ data.succeeded=1، أو 400 بجسم خطأ في
+  // وضع الفشل). دورة ربط البريد كاملة تمرّ عبر هذا المسار.
+  const s2gRequests = [];
+  let s2gMode = 'ok';
+  const s2gMock = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      let reqBody = {};
+      try { reqBody = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); } catch {}
+      s2gRequests.push({ method: req.method, url: req.url, headers: req.headers, body: reqBody });
+      if (s2gMode === 'ok') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ request_id: 'mock-s2g-req', data: { succeeded: 1, failed: 0, failures: [] } }));
+      } else {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ request_id: 'mock-s2g-req', data: { succeeded: 0, failed: 1, error: 'sender address not verified (mock)' } }));
+      }
+    });
+  });
+  await new Promise((r) => s2gMock.listen(0, '127.0.0.1', r));
+  const s2gMockUrl = `http://127.0.0.1:${s2gMock.address().port}/v3/email/send`;
+  const dataDir5 = fs.mkdtempSync(path.join(os.tmpdir(), 'msgtest-smtp2go-'));
+  const server5 = spawn('node', ['server.js'], {
+    cwd: root,
+    env: {
+      ...process.env, PORT: '3223', DATA_DIR: dataDir5,
+      MAIL_OUTBOX: '', SMTP_USER: '', SMTP_PASS: '', ADMIN_USERNAME: '',
+      BREVO_API_KEY: '', MAILJET_API_KEY: '', MAILJET_API_SECRET: '',
+      SMTP2GO_API_KEY: 's2g-key-789', MAIL_FROM: 'sender@test.dev', SMTP2GO_API_URL: s2gMockUrl,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  server5.stderr.on('data', (d) => process.stderr.write('[server5] ' + d));
+  try {
+    const apiS2g = async (p, { method = 'GET', token, body } = {}) => {
+      const res = await fetch('http://localhost:3223' + p, {
+        method,
+        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: res.status, data: await res.json().catch(() => ({})) };
+    };
+    let up5 = false;
+    for (let i = 0; i < 50 && !up5; i++) {
+      try { const r = await fetch('http://localhost:3223/api/health'); up5 = r.ok; } catch { await wait(200); }
+    }
+    check('الخادم الخامس (SMTP2GO) أقلع', up5);
+    const regS2g = await apiS2g('/api/register', { method: 'POST', body: { username: 'smtp2go_user', password: 'Smtp2go123!' } });
+    check('تسجيل smtp2go_user على خادم SMTP2GO', regS2g.status === 201 && !!regS2g.data.token, `status=${regS2g.status}`);
+    const tokS2g = regS2g.data.token;
+    s2gRequests.length = 0;
+    const s2gSend = await apiS2g('/api/me/email', { method: 'POST', token: tokS2g, body: { email: 'Target@Example.com' } });
+    check('طلب رمز تأكيد البريد عبر SMTP2GO ينجح (200)', s2gSend.status === 200 && s2gSend.data.ok === true,
+      `status=${s2gSend.status} err=${s2gSend.data.error || ''}`);
+    check('الوهمي استلم طلب POST واحداً فقط إلى مسار SMTP2GO',
+      s2gRequests.length === 1 && s2gRequests[0].method === 'POST' && s2gRequests[0].url === '/v3/email/send',
+      `count=${s2gRequests.length} url=${s2gRequests[0]?.url || ''}`);
+    const s2gReq = s2gRequests[0] || { headers: {}, body: {} };
+    check('ترويسة X-Smtp2go-Api-Key في طلب SMTP2GO تساوي المفتاح المضبوط', s2gReq.headers['x-smtp2go-api-key'] === 's2g-key-789',
+      `x-smtp2go-api-key=${s2gReq.headers['x-smtp2go-api-key'] || ''}`);
+    const s2gCode = codeFromMail({ text: s2gReq.body.text_body || '' });
+    check('حمولة SMTP2GO: المُرسِل المضبوط، والمستقبِل الصحيح، ونص فيه رمز من ٦ أرقام',
+      s2gReq.body.sender === 'sender@test.dev' &&
+      s2gReq.body.to?.[0] === 'target@example.com' && !!s2gCode,
+      JSON.stringify(s2gReq.body || {}));
+    const s2gVerify = await apiS2g('/api/me/email/verify', { method: 'POST', token: tokS2g, body: { code: s2gCode } });
+    check('تأكيد البريد بالرمز المُرسل عبر SMTP2GO ينجح ويرجع البريد',
+      s2gVerify.status === 200 && s2gVerify.data.email === 'target@example.com',
+      `status=${s2gVerify.status} err=${s2gVerify.data.error || ''}`);
+    const s2gMe = await apiS2g('/api/me', { token: tokS2g });
+    check('/api/me بعد تأكيد SMTP2GO: البريد مضبوط و emailVerified=true',
+      s2gMe.data.user?.email === 'target@example.com' && s2gMe.data.user?.emailVerified === true,
+      JSON.stringify(s2gMe.data.user || {}));
+    // مسار الفشل: الوهمي يردّ 400 بجسم خطأ — طلب الرمز يفشل 502 ولا يصلح أي رمز
+    s2gMode = 'fail';
+    const regS2g2 = await apiS2g('/api/register', { method: 'POST', body: { username: 'smtp2go_fail', password: 'Smtp2go123!' } });
+    check('تسجيل smtp2go_fail على خادم SMTP2GO', regS2g2.status === 201 && !!regS2g2.data.token, `status=${regS2g2.status}`);
+    const s2gFailSend = await apiS2g('/api/me/email', { method: 'POST', token: regS2g2.data.token, body: { email: 'fail@example.com' } });
+    check('عند ردّ SMTP2GO بـ 400: طلب الرمز يرجع 502 «تعذّر إرسال البريد»',
+      s2gFailSend.status === 502 && (s2gFailSend.data.error || '').includes('تعذّر إرسال'),
+      `status=${s2gFailSend.status} err=${s2gFailSend.data.error || ''}`);
+    const s2gFailVerify = await apiS2g('/api/me/email/verify', { method: 'POST', token: regS2g2.data.token, body: { code: '123456' } });
+    check('بعد فشل إرسال SMTP2GO لا يوجد رمز صالح (التأكيد يرجع 400)', s2gFailVerify.status === 400, `status=${s2gFailVerify.status}`);
+  } finally {
+    server5.kill();
+    s2gMock.close();
+    fs.rmSync(dataDir5, { recursive: true, force: true });
   }
 
   B2.close();
