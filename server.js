@@ -20,8 +20,9 @@ const PORT = process.env.PORT || 3000;
 const USERNAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,23}$/;
 const USERNAME_ERROR = 'اسم المستخدم يجب أن يبدأ بحرف أو رقم، ويمكن أن يحتوي على حروف وأرقام و _ . - فقط';
 const USERNAME_TAKEN_ERROR = 'اسم المستخدم هذا مستخدم من قبل، اختر اسماً آخر';
-const USERNAME_RESERVED_ERROR = 'هذا الاسم محجوز مؤقتاً لصاحبه السابق، يصبح متاحاً بعد انتهاء الحجز (٣ أيام من تغييره)';
-const NAME_HOLD_MS = 3 * 24 * 60 * 60 * 1000; // حجز الاسم المُخلى: ٣ أيام
+// اسم مستخدم المالك (Admin) — يُضبط من البيئة فقط. عند فراغه تُعطَّل لوحة البيانات
+// كلّياً (نقاط /api/admin/* ترجع 404). المطابقة دقيقة لحالة الأحرف.
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || '';
 
 // قوة كلمة المرور (عند التسجيل فقط): 4 حروف على الأقل + رقم + رمز
 function passwordError(password) {
@@ -49,7 +50,13 @@ function newToken() {
   return crypto.randomBytes(32).toString('hex');
 }
 function publicUser(u) {
-  return { id: u.id, username: u.username, createdAt: u.createdAt, avatar: store.avatarUrl(u) };
+  return {
+    id: u.id,
+    username: u.username,
+    createdAt: u.createdAt,
+    avatar: store.avatarUrl(u),
+    isAdmin: !!ADMIN_USERNAME && u.username === ADMIN_USERNAME,
+  };
 }
 function publicMessage(m) {
   const from = store.getUserById(m.fromId);
@@ -144,10 +151,6 @@ app.post('/api/register', (req, res) => {
   if (store.getUserByUsername(name)) {
     return res.status(409).json({ error: USERNAME_TAKEN_ERROR });
   }
-  // اسم مُخلى حديثاً وما زال محجوزاً لصاحبه السابق (٣ أيام) — لا يُسجَّل به حساب جديد
-  if (store.getNameReservation(name)) {
-    return res.status(409).json({ error: USERNAME_RESERVED_ERROR });
-  }
   const { salt, hash } = hashPassword(String(password));
   const user = { id: crypto.randomUUID(), username: name, salt, hash, createdAt: Date.now() };
   store.createUser(user);
@@ -191,10 +194,9 @@ app.post('/api/me/avatar', requireAuth, (req, res) => {
 });
 
 // تغيير اسم المستخدم: نفس قواعد التسجيل (1–24، يبدأ بحرف/رقم، فرادة دقيقة لحالة الأحرف).
-// الاسم القديم يُحجز لصاحبه ٣ أيام: لا يستطيع غيره أخذه (تسجيلاً أو تغييراً) قبل انتهاء
-// الحجز، ويستطيع صاحبه الرجوع إليه في أي وقت خلالها. الهوية ثابتة بالمعرّف (id) —
-// الرسائل والمحادثات والجلسة مرتبطة بالمعرّف لا بالاسم، فتتبع المستخدم اسمه الجديد
-// تلقائياً في كل مكان دون أي ترحيل للبيانات.
+// لا مهلة حجز على الاسم القديم: بمجرد تغييره يصبح متاحاً فوراً لأي شخص آخر (تسجيلاً
+// أو تغييراً). الهوية ثابتة بالمعرّف (id) — الرسائل والمحادثات والجلسة مرتبطة
+// بالمعرّف لا بالاسم، فتتبع المستخدم اسمه الجديد تلقائياً في كل مكان دون ترحيل بيانات.
 app.post('/api/me/username', requireAuth, (req, res) => {
   const name = String((req.body || {}).username || '').trim();
   if (!USERNAME_RE.test(name)) {
@@ -208,15 +210,8 @@ app.post('/api/me/username', requireAuth, (req, res) => {
   if (existing && existing.id !== me.id) {
     return res.status(409).json({ error: USERNAME_TAKEN_ERROR });
   }
-  const reservation = store.getNameReservation(name);
-  if (reservation && reservation.ownerId !== me.id) {
-    return res.status(409).json({ error: USERNAME_RESERVED_ERROR });
-  }
-  const oldName = me.username;
-  if (reservation) store.removeNameReservation(name); // استرجاع اسمي المحجوز لي — يُستهلك الحجز
   me.username = name;
   store.saveUser();
-  store.addNameReservation(oldName, me.id, Date.now() + NAME_HOLD_MS);
   // إعادة بثّ الحضور بالأسماء الجديدة حتى تتحدث القوائم عند الجميع
   broadcastPresence();
   res.json({ user: publicUser(me) });
@@ -225,6 +220,13 @@ app.post('/api/me/username', requireAuth, (req, res) => {
 // ---------- دليل المستخدمين ----------
 app.get('/api/users', requireAuth, (req, res) => {
   res.json({ users: store.listUsers(req.user.id, req.query.q || '') });
+});
+
+// عرض ملف مستخدم واحد: الاسم + رابط الصورة الشخصية (أو null) + حالة الاتصال الآن
+app.get('/api/users/:username', requireAuth, (req, res) => {
+  const u = store.getUserByUsername(req.params.username);
+  if (!u) return res.status(404).json({ error: 'المستخدم غير موجود' });
+  res.json({ username: u.username, avatar: store.avatarUrl(u), online: isUserOnline(u.id) });
 });
 
 // ---------- المحادثات والرسائل ----------
@@ -331,6 +333,125 @@ app.delete('/api/messages/:id', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------- لوحة بيانات المالك (Admin) ----------
+// متاحة فقط عندما يُضبط ADMIN_USERNAME في البيئة ويطابق اسم مستخدم الجلسة بدقّة.
+// بدون الضبط ترجع كل النقاط 404 (كأنها غير موجودة)، ولغير المالك 403.
+function requireAdmin(req, res, next) {
+  if (!ADMIN_USERNAME) return res.status(404).json({ error: 'غير موجود' });
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: 'غير مصرح — سجّل الدخول أولاً' });
+  if (user.username !== ADMIN_USERNAME) return res.status(403).json({ error: 'صلاحيات غير كافية' });
+  req.user = user;
+  next();
+}
+// نص معاينة لآخر رسالة — يطابق منطق الواجهة (previewText)
+function previewTextOf(m) {
+  if (!m) return '';
+  if (m.deleted) return '🚫 تم حذف هذه الرسالة';
+  if (m.kind === 'image') return '📷 صورة';
+  if (m.kind === 'video') return '🎥 فيديو';
+  if (m.kind === 'voice') return '🎤 رسالة صوتية';
+  return m.text || ''; // سجلات المكالمات (kind=call) نصّها جاهز كعنوان
+}
+// مسلسِل رسالة للمالك: كل الحقول — بما فيها المحذوفة لدى الجميع ومعلومات الإخفاء،
+// وروابط ملفات الوسائط ما دامت الرسالة تحتفظ بمرجع ملفها.
+function adminMessage(m) {
+  const from = store.getUserById(m.fromId);
+  const to = store.getUserById(m.toId);
+  const out = {
+    id: m.id,
+    from: from ? from.username : null,
+    to: to ? to.username : null,
+    text: m.text,
+    kind: m.kind || 'text',
+    ts: m.ts,
+    deliveredAt: m.deliveredAt || null,
+    readAt: m.readAt || null,
+    deleted: !!m.deleted,
+    hiddenFor: (Array.isArray(m.hiddenFor) ? m.hiddenFor : []).map((id) => {
+      const u = store.getUserById(id);
+      return u ? u.username : id;
+    }),
+  };
+  if (m.fileId) {
+    out.fileId = m.fileId;
+    out.fileUrl = '/files/' + m.fileId;
+    out.mime = m.mime || null;
+    out.size = m.size || null;
+    out.durationSec = m.durationSec || null;
+  }
+  return out;
+}
+
+app.get('/api/admin/overview', requireAdmin, (req, res) => {
+  const uploads = store.listUploads();
+  res.json({
+    users: store.listAllUsers().length,
+    messages: store.getAllMessages().length,
+    uploads: uploads.length,
+    uploadBytes: uploads.reduce((sum, u) => sum + (u.size || 0), 0),
+  });
+});
+
+app.get('/api/admin/users', requireAdmin, (req, res) => {
+  const users = store.listAllUsers()
+    .map((u) => ({ username: u.username, avatar: store.avatarUrl(u), online: isUserOnline(u.id), createdAt: u.createdAt }))
+    .sort((a, b) => a.username.localeCompare(b.username));
+  res.json({ users });
+});
+
+app.get('/api/admin/conversations', requireAdmin, (req, res) => {
+  const byPair = new Map(); // "idA|idB" (مرتبة) -> { aId, bId, count, last }
+  for (const m of store.getAllMessages()) {
+    const [aId, bId] = [m.fromId, m.toId].sort();
+    const key = aId + '|' + bId;
+    if (!byPair.has(key)) byPair.set(key, { aId, bId, count: 0, last: null });
+    const row = byPair.get(key);
+    row.count += 1; // يشمل سجلات المكالمات (kind=call) كأي رسالة
+    if (!row.last || m.ts >= row.last.ts) row.last = m;
+  }
+  const conversations = [];
+  for (const row of byPair.values()) {
+    const a = store.getUserById(row.aId);
+    const b = store.getUserById(row.bId);
+    if (!a || !b) continue;
+    conversations.push({
+      a: a.username,
+      b: b.username,
+      count: row.count,
+      lastText: previewTextOf(row.last),
+      lastAt: row.last ? row.last.ts : null,
+    });
+  }
+  conversations.sort((x, y) => (y.lastAt || 0) - (x.lastAt || 0));
+  res.json({ conversations });
+});
+
+app.get('/api/admin/messages', requireAdmin, (req, res) => {
+  const a = req.query.a ? store.getUserByUsername(String(req.query.a)) : null;
+  const b = req.query.b ? store.getUserByUsername(String(req.query.b)) : null;
+  if (!a || !b) return res.status(404).json({ error: 'المستخدم غير موجود' });
+  const messages = store.getConversation(a.id, b.id).map(adminMessage);
+  res.json({ a: a.username, b: b.username, messages });
+});
+
+app.get('/api/admin/uploads', requireAdmin, (req, res) => {
+  const uploads = store.listUploads()
+    .map((u) => {
+      const owner = store.getUserById(u.ownerId);
+      return {
+        id: u.id,
+        owner: owner ? owner.username : null,
+        mime: u.mime,
+        size: u.size,
+        createdAt: u.ts || null,
+        url: '/files/' + u.id,
+      };
+    })
+    .sort((x, y) => (y.createdAt || 0) - (x.createdAt || 0));
+  res.json({ uploads });
+});
+
 // ---------- رفع الملفات وتقديمها ----------
 // الجسم الخام كما هو (حتى 100MB) — تُحفظ البايتات الأصلية دون أي معالجة.
 app.post('/api/upload', requireAuth, express.raw({ type: () => true, limit: '100mb' }), (req, res) => {
@@ -414,6 +535,10 @@ function sendToUser(userId, obj) {
   let n = 0;
   for (const ws of set) { wsSend(ws, obj); n += 1; }
   return n;
+}
+function isUserOnline(userId) {
+  const set = connections.get(userId);
+  return !!set && set.size > 0;
 }
 function broadcastPresence() {
   const online = [];

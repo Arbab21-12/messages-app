@@ -8,7 +8,8 @@
  *   createSession, getUserIdByToken, deleteSession,
  *   listUsers, addMessage, getConversation, markConversationRead,
  *   markDelivered, getUndeliveredFor,
- *   getNameReservation, addNameReservation, removeNameReservation
+ *   getNameReservation, addNameReservation, removeNameReservation,
+ *   listAllUsers, getAllMessages, listUploads
  */
 const fs = require('fs');
 const path = require('path');
@@ -75,7 +76,21 @@ function listUsers(excludeId, query) {
     .sort((a, b) => a.username.localeCompare(b.username));
 }
 
-// ---------- حجوزات الأسماء (اسم مُخلى عند تغيير الاسم — محجوز لصاحبه السابق ٣ أيام) ----------
+// ---------- وصول المالك/الإدارة (قراءة شاملة للوحة البيانات) ----------
+function listAllUsers() {
+  return db.users.slice();
+}
+function getAllMessages() {
+  return db.messages.slice();
+}
+function listUploads() {
+  return Object.entries(db.uploads).map(([id, meta]) => ({ id, ...meta }));
+}
+
+// ---------- حجوزات الأسماء (قديمة — لم تعد مستخدمة من الخادم) ----------
+// أُلغيت مهلة حجز الاسم المُخلى (٣ أيام): الاسم المتروك يصبح متاحاً فوراً لأي شخص.
+// تبقى هذه الدوال وحقل nameReservations في ملف البيانات للتوافق مع ملفات البيانات
+// القديمة التي قد تحتوي حجوزات سابقة — تُحمَّل وتُحفَظ كما هي دون أي أثر وظيفي.
 // كل حجز: { name, ownerId, until } — المطابقة دقيقة لحالة الأحرف، والحجوزات المنتهية
 // تُنظَّف بتكاسل (lazily) عند أول قراءة/كتابة.
 function pruneReservations() {
@@ -211,4 +226,7 @@ module.exports = {
   addUpload,
   getUpload,
   removeUpload,
+  listAllUsers,
+  getAllMessages,
+  listUploads,
 };
