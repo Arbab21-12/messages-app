@@ -1,7 +1,9 @@
 // اختبار شامل (End-to-End) — يشغّل الخادم على منفذ اختبار مع مجلد بيانات مؤقت،
 // ثم يتحقق من: التسجيل، رفض التكرار وكلمة المرور الخاطئة، الإرسال اللحظي عبر
 // WebSocket، سجل المحادثة، إشعار القراءة، والرسائل أثناء عدم الاتصال، وقواعد
-// الحساب الجديد (بداية اسم المستخدم وقوة كلمة المرور عند التسجيل فقط).
+// الحساب الجديد (بداية اسم المستخدم وقوة كلمة المرور عند التسجيل فقط)، وطول
+// الاسم 1–24 وحساسية حالة الأحرف، والصورة الشخصية، وتغيير اسم المستخدم مع
+// حجز الاسم القديم ٣ أيام وانتهاء الحجز (بإعادة تشغيل الخادم على نفس البيانات).
 // التشغيل: npm test
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -59,19 +61,26 @@ function connectWs(token) {
 }
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const server = spawn('node', ['server.js'], {
-  cwd: root,
-  env: { ...process.env, PORT: String(PORT), DATA_DIR: dataDir },
-  stdio: ['ignore', 'pipe', 'pipe'],
-});
-server.stderr.on('data', (d) => process.stderr.write('[server] ' + d));
+function startServer() {
+  const s = spawn('node', ['server.js'], {
+    cwd: root,
+    env: { ...process.env, PORT: String(PORT), DATA_DIR: dataDir },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  s.stderr.on('data', (d) => process.stderr.write('[server] ' + d));
+  return s;
+}
+let server = startServer();
+async function waitUp() {
+  for (let i = 0; i < 50; i++) {
+    try { const r = await fetch(BASE + '/api/health'); if (r.ok) return true; } catch { await wait(200); }
+  }
+  return false;
+}
 
 try {
   // انتظار إقلاع الخادم
-  let up = false;
-  for (let i = 0; i < 50 && !up; i++) {
-    try { const r = await fetch(BASE + '/api/health'); up = r.ok; } catch { await wait(200); }
-  }
+  const up = await waitUp();
   if (!up) throw new Error('الخادم لم يقلع');
   console.log('الخادم أقلع — بدء الفحوصات:');
 
@@ -273,8 +282,8 @@ try {
   check('اسم يبدأ بـ . يُرفض 400', badStart2.status === 400, `status=${badStart2.status}`);
   const digitStart = await api('/api/register', { method: 'POST', body: { username: '9user_x', password: STRONG } });
   check('اسم يبدأ برقم (9user_x) مع كلمة قوية ينجح', digitStart.status === 201 && !!digitStart.data.token, `status=${digitStart.status}`);
-  const tooShort = await api('/api/register', { method: 'POST', body: { username: 'ab', password: STRONG } });
-  check('اسم قصير (حرفان) يُرفض 400', tooShort.status === 400, `status=${tooShort.status}`);
+  const twoChars = await api('/api/register', { method: 'POST', body: { username: 'ab', password: STRONG } });
+  check('اسم من حرفين (ab) صالح الآن وينجح', twoChars.status === 201 && !!twoChars.data.token, `status=${twoChars.status}`);
   const dupMsg = await api('/api/register', { method: 'POST', body: { username: 'omar_test', password: STRONG } });
   check('اسم مكرر يُرفض مع رسالة «مستخدم من قبل، اختر اسماً آخر»',
     dupMsg.status === 409 && (dupMsg.data.error || '').includes('مستخدم من قبل، اختر اسماً آخر'),
@@ -292,6 +301,83 @@ try {
   check('كلمة «abcd123!» (٤ حروف + رقم + رمز) تنجح', strongReg.status === 201 && !!strongReg.data.token, `status=${strongReg.status}`);
   const strongLogin = await api('/api/login', { method: 'POST', body: { username: pwUser, password: 'abcd123!' } });
   check('الدخول بالحساب ذي الكلمة القوية يعمل', strongLogin.status === 200 && !!strongLogin.data.token, `status=${strongLogin.status}`);
+
+  // 12) طول الاسم 1–24 + حساسية حالة الأحرف في الهوية (مطابقة دقيقة)
+  const oneCharA = await api('/api/register', { method: 'POST', body: { username: 'A', password: STRONG } });
+  check('اسم من حرف واحد (A) ينجح', oneCharA.status === 201 && !!oneCharA.data.token, `status=${oneCharA.status}`);
+  const oneChar7 = await api('/api/register', { method: 'POST', body: { username: '7', password: STRONG } });
+  check('اسم من رقم واحد (7) ينجح', oneChar7.status === 201 && !!oneChar7.data.token, `status=${oneChar7.status}`);
+  const tooLong = await api('/api/register', { method: 'POST', body: { username: 'a'.repeat(25), password: STRONG } });
+  check('اسم من ٢٥ حرفاً يُرفض 400', tooLong.status === 400, `status=${tooLong.status}`);
+  const caseLow = await api('/api/register', { method: 'POST', body: { username: 'caseuser', password: 'Case1111!' } });
+  check('تسجيل caseuser ينجح', caseLow.status === 201, `status=${caseLow.status}`);
+  const caseUp = await api('/api/register', { method: 'POST', body: { username: 'CaseUser', password: 'Case2222!' } });
+  check('تسجيل CaseUser (حالة مختلفة) ينجح كحساب منفصل', caseUp.status === 201 && !!caseUp.data.token, `status=${caseUp.status}`);
+  const caseLogin = await api('/api/login', { method: 'POST', body: { username: 'CaseUser', password: 'Case2222!' } });
+  check('الدخول كـ CaseUser بنفس حالة الأحرف وكلمته يعمل', caseLogin.status === 200 && caseLogin.data.user?.username === 'CaseUser', `status=${caseLogin.status}`);
+  const caseCross = await api('/api/login', { method: 'POST', body: { username: 'caseuser', password: 'Case2222!' } });
+  check('كلمة CaseUser لا تفتح حساب caseuser (حسابان منفصلان)', caseCross.status === 401, `status=${caseCross.status}`);
+  const caseWrongCase = await api('/api/login', { method: 'POST', body: { username: 'CASEUSER', password: 'Case1111!' } });
+  check('الدخول بحالة أحرف غير المسجّلة (CASEUSER) يُرفض 401', caseWrongCase.status === 401, `status=${caseWrongCase.status}`);
+
+  // 13) الصورة الشخصية: رفع + تعيين + ظهورها في /api/me والدليل والمحادثات
+  const upAvatar = await uploadRaw(PNG_BYTES, { token: tokA, mime: 'image/png', name: 'avatar.png' });
+  check('رفع صورة للصورة الشخصية ناجح', upAvatar.status === 201 && !!upAvatar.data.fileId, `status=${upAvatar.status}`);
+  const avatarUrl = '/files/' + upAvatar.data.fileId;
+  const setAvatar = await api('/api/me/avatar', { method: 'POST', token: tokA, body: { fileId: upAvatar.data.fileId } });
+  check('تعيين الصورة الشخصية ينجح ويعيد رابطها', setAvatar.status === 200 && setAvatar.data.user?.avatar === avatarUrl, `status=${setAvatar.status} avatar=${setAvatar.data.user?.avatar}`);
+  const meAfterAvatar = await api('/api/me', { token: tokA });
+  check('/api/me يعرض الصورة الشخصية', meAfterAvatar.data.user?.avatar === avatarUrl, `avatar=${meAfterAvatar.data.user?.avatar}`);
+  const dirAvatar = await api('/api/users?q=omar_test', { token: tokB2 });
+  check('الدليل يعرض صورة omar_test للمستخدمين الآخرين', dirAvatar.data.users?.find((u) => u.username === 'omar_test')?.avatar === avatarUrl);
+  const convsAvatar = await api('/api/conversations', { token: tokB2 });
+  check('قائمة المحادثات تتضمن صورة الطرف الآخر', convsAvatar.data.conversations?.find((c) => c.username === 'omar_test')?.avatar === avatarUrl);
+  const gotAvatar = await getFileRaw(avatarUrl);
+  check('رابط الصورة الشخصية يعيد نفس بايتات PNG', gotAvatar.status === 200 && gotAvatar.buf.equals(PNG_BYTES), `status=${gotAvatar.status}`);
+  const avatarSteal = await api('/api/me/avatar', { method: 'POST', token: tokB2, body: { fileId: upAvatar.data.fileId } });
+  check('تعيين ملف شخص آخر صورةً شخصية يُرفض 403', avatarSteal.status === 403, `status=${avatarSteal.status}`);
+  const upAudio = await uploadRaw(Buffer.from('FAKE_WEBM_AUDIO_BYTES'), { token: tokA, mime: 'audio/webm', name: 'v.webm' });
+  const avatarNonImage = await api('/api/me/avatar', { method: 'POST', token: tokA, body: { fileId: upAudio.data.fileId } });
+  check('تعيين ملف غير صورة (صوت) صورةً شخصية يُرفض 400', avatarNonImage.status === 400, `status=${avatarNonImage.status}`);
+
+  // 14) تغيير اسم المستخدم + حجز الاسم القديم ٣ أيام + انتهاء الحجز
+  const rename1 = await api('/api/me/username', { method: 'POST', token: tokB2, body: { username: 'sara_new' } });
+  check('sara_test تغيّر اسمها إلى sara_new', rename1.status === 200 && rename1.data.user?.username === 'sara_new', `status=${rename1.status}`);
+  const meRenamed = await api('/api/me', { token: tokB2 });
+  check('جلسة sara ما زالت صالحة و/api/me يعرض الاسم الجديد', meRenamed.data.user?.username === 'sara_new', `username=${meRenamed.data.user?.username}`);
+  const convsAfterRename = await api('/api/conversations', { token: tokA });
+  const convRenamed = convsAfterRename.data.conversations?.find((c) => c.username === 'sara_new');
+  check('محادثات omar تعرض المحادثة بالاسم الجديد sara_new', !!convRenamed && !!convRenamed.lastMessage);
+  const histRenamed = await api('/api/messages/sara_new', { token: tokA });
+  check('السجل القديم سليم تحت الاسم الجديد (رسالة الاختبار موجودة)',
+    histRenamed.data.messages?.some((m) => m.text.includes('رسالة اختبار')));
+  const regReserved = await api('/api/register', { method: 'POST', body: { username: 'sara_test', password: STRONG } });
+  check('تسجيل حساب جديد بالاسم المُخلى المحجوز يُرفض مع رسالة الحجز',
+    regReserved.status === 409 && (regReserved.data.error || '').includes('محجوز'), `status=${regReserved.status} err=${regReserved.data.error || ''}`);
+  const stealReserved = await api('/api/me/username', { method: 'POST', token: tokA, body: { username: 'sara_test' } });
+  check('تغيير اسم omar إلى الاسم المحجوز لغيره يُرفض مع رسالة الحجز',
+    stealReserved.status === 409 && (stealReserved.data.error || '').includes('محجوز'), `status=${stealReserved.status}`);
+  const renameBack = await api('/api/me/username', { method: 'POST', token: tokB2, body: { username: 'sara_test' } });
+  check('صاحبة الاسم ترجع إلى اسمها المحجوز خلال الحجز', renameBack.status === 200 && renameBack.data.user?.username === 'sara_test', `status=${renameBack.status}`);
+  const rename2 = await api('/api/me/username', { method: 'POST', token: tokB2, body: { username: 'sara_new2' } });
+  check('تغيير الاسم مجدداً إلى sara_new2 (يُنشئ حجزاً جديداً لـ sara_test)', rename2.status === 200 && rename2.data.user?.username === 'sara_new2', `status=${rename2.status}`);
+
+  // انتهاء الحجز: نوقف الخادم ونرجع بتاريخ الحجز في ملف البيانات إلى الماضي، ثم نعيد التشغيل
+  server.kill();
+  await wait(700);
+  const dataFile = path.join(dataDir, 'data.json');
+  const stored = JSON.parse(fs.readFileSync(dataFile, 'utf8'));
+  const resvEntry = (stored.nameReservations || []).find((r) => r.name === 'sara_test');
+  check('سجل حجز sara_test موجود في ملف البيانات', !!resvEntry, JSON.stringify(stored.nameReservations || []));
+  if (resvEntry) {
+    resvEntry.until = Date.now() - 1000;
+    fs.writeFileSync(dataFile, JSON.stringify(stored, null, 2), 'utf8');
+  }
+  server = startServer();
+  const upAgain = await waitUp();
+  check('الخادم عاد بعد إعادة التشغيل', upAgain);
+  const regAfterExpiry = await api('/api/register', { method: 'POST', body: { username: 'sara_test', password: STRONG } });
+  check('بعد انتهاء الحجز يصبح الاسم متاحاً للتسجيل من جديد', regAfterExpiry.status === 201 && !!regAfterExpiry.data.token, `status=${regAfterExpiry.status}`);
 
   B2.close();
   A.close();
