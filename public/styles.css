@@ -52,8 +52,36 @@ button.ghost { background:transparent; color:var(--brand); border:1px solid var(
 .bubble.theirs { align-self:flex-end; background:var(--theirs); border-bottom-left-radius:4px; }
 .bubble .meta { display:block; font-size:11px; color:var(--muted); margin-top:3px; text-align:left; direction:ltr; }
 .bubble .ticks.read { color:#1b9aaa; }
-.composer { display:flex; gap:8px; padding:10px; border-top:1px solid var(--border); background:#fff; }
+.composer { display:flex; gap:8px; padding:10px; border-top:1px solid var(--border); background:#fff; align-items:center; }
 .composer input { flex:1; }
+
+/* رسالة محذوفة لدى الجميع */
+.bubble.deleted { font-style:italic; color:var(--muted); }
+
+/* فقاعات الوسائط */
+.bubble.media { padding:6px; }
+.bubble.media .meta { padding:0 6px; }
+.msg-img { display:block; max-width:260px; width:100%; border-radius:12px; }
+.msg-video { display:block; max-width:280px; width:100%; border-radius:12px; background:#000; }
+.voice-player { display:flex; align-items:center; gap:10px; min-width:180px; padding:2px 4px; }
+.voice-play { width:38px; height:38px; border-radius:50%; padding:0; font-size:14px; flex:none; display:flex; align-items:center; justify-content:center; }
+.voice-dur { font-size:13px; color:#33413b; font-variant-numeric:tabular-nums; }
+.voice-player audio { display:none; }
+
+/* قائمة حذف الرسالة */
+.msg-menu { position:fixed; z-index:90; background:#fff; border:1px solid var(--border); border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,.2); display:flex; flex-direction:column; min-width:190px; padding:4px; }
+.msg-menu button { background:transparent; color:#17211d; text-align:start; padding:11px 12px; border-radius:8px; }
+.msg-menu button:hover { background:#f2f7f4; }
+.msg-menu #menu-del-everyone { color:#b3261e; }
+
+/* شريط التسجيل الصوتي وحالة الرفع */
+.recording-bar { display:flex; align-items:center; gap:10px; padding:10px; border-top:1px solid var(--border); background:#fff7f5; }
+.rec-dot { width:11px; height:11px; border-radius:50%; background:#c0392b; flex:none; animation:recblink 1s ease-in-out infinite; }
+@keyframes recblink { 50% { opacity:.2; } }
+.rec-label { flex:1; color:var(--muted); font-size:14px; }
+#rec-time { font-variant-numeric:tabular-nums; font-weight:600; }
+.upload-status { padding:8px 12px; font-size:13px; color:var(--muted); background:#fff; border-top:1px solid var(--border); text-align:center; }
+.icon-btn:disabled { opacity:.45; cursor:default; }
 
 /* أزرار المكالمات في ترويسة المحادثة */
 .chat-actions { display:flex; gap:6px; flex:none; }
@@ -78,3 +106,4 @@ button.ghost { background:transparent; color:var(--brand); border:1px solid var(
 .call-btn.reject { background:#c0392b; border-color:#c0392b; }
 .call-btn.off { background:#4d4d4d; border-color:#4d4d4d; opacity:.8; }
 .call-overlay .error { position:relative; z-index:3; color:#ffd7d4; background:rgba(0,0,0,.35); padding:8px 14px; border-radius:10px; margin:0; max-width:420px; text-align:center; }
+.call-toast { position:absolute; left:50%; transform:translateX(-50%); bottom:118px; z-index:5; background:rgba(0,0,0,.75); color:#fff; padding:9px 16px; border-radius:999px; font-size:14px; max-width:88%; text-align:center; }

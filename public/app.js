@@ -98,6 +98,16 @@ function connectWs() {
       }
       loadConversations();
     }
+    if (data.type === 'message_deleted') {
+      const el = document.querySelector(`.bubble[data-id="${data.id}"]`);
+      if (data.scope === 'everyone') {
+        if (el) renderTombstone(el);
+      } else if (data.scope === 'me' && data.by === me.username) {
+        // حذف «لديّ» من جهاز آخر لنفس المستخدم — أخفِها هنا أيضاً
+        if (el) el.remove();
+      }
+      loadConversations();
+    }
     if (typeof data.type === 'string' && data.type.startsWith('call_')) {
       handleCallEvent(data);
     }
@@ -117,6 +127,14 @@ function connectWs() {
 }
 
 // ---------- المحادثات ----------
+function previewText(m) {
+  if (!m) return '';
+  if (m.deleted) return '🚫 تم حذف هذه الرسالة';
+  if (m.kind === 'image') return '📷 صورة';
+  if (m.kind === 'video') return '🎥 فيديو';
+  if (m.kind === 'voice') return '🎤 رسالة صوتية';
+  return m.text || '';
+}
 async function loadConversations() {
   if (!me) return;
   const { conversations } = await api('/api/conversations');
@@ -130,7 +148,7 @@ async function loadConversations() {
       <div class="avatar">${escapeHtml(c.username[0] || '؟')}</div>
       <div class="row-main">
         <div class="row-title"><span>${escapeHtml(c.username)}</span><time>${last ? fmtTime(last.ts) : ''}</time></div>
-        <div class="row-sub">${last ? escapeHtml(last.text) : ''}</div>
+        <div class="row-sub">${escapeHtml(previewText(last))}</div>
       </div>
       ${c.unread ? `<span class="badge">${c.unread}</span>` : ''}`;
     li.onclick = () => openChat(c.username);
@@ -187,7 +205,7 @@ async function openChat(username) {
 $('back-btn').onclick = () => { currentChat = null; show('main-screen'); loadConversations(); };
 
 function appendMessage(m, scroll = true) {
-  if (m.kind === 'call') {
+  if (m.kind === 'call' && !m.deleted) {
     const div = document.createElement('div');
     div.className = 'call-record';
     div.dataset.id = m.id;
@@ -199,9 +217,46 @@ function appendMessage(m, scroll = true) {
   const div = document.createElement('div');
   div.className = 'bubble ' + (m.from === me.username ? 'mine' : 'theirs');
   div.dataset.id = m.id;
-  div.innerHTML = `${escapeHtml(m.text)}<span class="meta">${fmtTime(m.ts)}${m.from === me.username ? ' ' + ticks(m) : ''}</span>`;
+  div.dataset.from = m.from;
+  const meta = `<span class="meta">${fmtTime(m.ts)}${m.from === me.username ? ' ' + ticks(m) : ''}</span>`;
+  if (m.deleted) {
+    div.classList.add('deleted');
+    div.innerHTML = `<span class="deleted-text">🚫 تم حذف هذه الرسالة</span>${meta}`;
+  } else if (m.kind === 'image') {
+    div.classList.add('media');
+    div.innerHTML = `<a href="${m.fileUrl}" target="_blank" rel="noopener"><img class="msg-img" src="${m.fileUrl}" alt="صورة" loading="lazy"></a>${meta}`;
+  } else if (m.kind === 'video') {
+    div.classList.add('media');
+    div.innerHTML = `<video class="msg-video" src="${m.fileUrl}" controls preload="metadata" playsinline></video>${meta}`;
+  } else if (m.kind === 'voice') {
+    div.classList.add('media');
+    div.innerHTML = `<div class="voice-player"><button type="button" class="voice-play" title="تشغيل">▶</button><span class="voice-dur">${fmtCallDuration(m.durationSec || 0)}</span><audio src="${m.fileUrl}" preload="metadata"></audio></div>${meta}`;
+    wireVoicePlayer(div, m);
+  } else {
+    div.innerHTML = `${escapeHtml(m.text)}${meta}`;
+  }
   $('messages').appendChild(div);
   if (scroll) scrollBottom();
+}
+
+// مشغّل الرسائل الصوتية: زر تشغيل/إيقاف + مدة تتحدث أثناء التشغيل
+function wireVoicePlayer(div, m) {
+  const audio = div.querySelector('audio');
+  const btn = div.querySelector('.voice-play');
+  const dur = div.querySelector('.voice-dur');
+  if (!audio || !btn) return;
+  const total = () => Math.round(m.durationSec || (isFinite(audio.duration) ? audio.duration : 0));
+  btn.onclick = () => {
+    if (audio.paused) {
+      document.querySelectorAll('.voice-player audio').forEach((a) => { if (a !== audio) a.pause(); });
+      audio.play().catch(() => {});
+    } else audio.pause();
+  };
+  audio.onplay = () => { btn.textContent = '⏸'; };
+  audio.onpause = () => { btn.textContent = '▶'; };
+  audio.onloadedmetadata = () => { if (!m.durationSec && isFinite(audio.duration)) dur.textContent = fmtCallDuration(Math.round(audio.duration)); };
+  audio.ontimeupdate = () => { if (!audio.paused) dur.textContent = fmtCallDuration(Math.floor(audio.currentTime)) + ' / ' + fmtCallDuration(total()); };
+  audio.onended = () => { btn.textContent = '▶'; dur.textContent = fmtCallDuration(total()); };
 }
 async function refreshChatTicks() {
   if (!currentChat) return;
@@ -231,6 +286,191 @@ $('send-form').addEventListener('submit', (e) => {
       .catch((err) => alert(err.message));
   }
 });
+
+// ---------- حذف الرسائل (قائمة بالضغط المطوّل أو النقر باليمين) ----------
+let menuMsgId = null;
+let menuEl = null;
+
+function renderTombstone(el) {
+  if (!el || el.classList.contains('deleted')) return;
+  const meta = el.querySelector('.meta');
+  el.classList.add('deleted');
+  el.classList.remove('media');
+  el.innerHTML = '<span class="deleted-text">🚫 تم حذف هذه الرسالة</span>';
+  if (meta) el.appendChild(meta);
+}
+function openMsgMenu(el, x, y) {
+  menuMsgId = el.dataset.id;
+  menuEl = el;
+  $('menu-del-everyone').hidden = el.dataset.from !== me.username; // «لدى الجميع» لرسائلي فقط
+  const menu = $('msg-menu');
+  menu.hidden = false;
+  menu.style.left = Math.max(8, Math.min(x, window.innerWidth - 210)) + 'px';
+  menu.style.top = Math.max(8, Math.min(y, window.innerHeight - 170)) + 'px';
+}
+function closeMsgMenu() {
+  $('msg-menu').hidden = true;
+  menuMsgId = null;
+  menuEl = null;
+}
+async function deleteMessage(scope) {
+  const id = menuMsgId;
+  const el = menuEl;
+  closeMsgMenu();
+  if (!id) return;
+  try {
+    await api('/api/messages/' + encodeURIComponent(id), { method: 'DELETE', body: JSON.stringify({ scope }) });
+  } catch (err) { alert(err.message); return; }
+  if (scope === 'me') { if (el) el.remove(); }
+  else if (el) renderTombstone(el);
+  loadConversations();
+}
+$('menu-del-everyone').onclick = () => deleteMessage('everyone');
+$('menu-del-me').onclick = () => deleteMessage('me');
+$('menu-cancel').onclick = closeMsgMenu;
+
+const msgBox = $('messages');
+msgBox.addEventListener('contextmenu', (e) => {
+  const b = e.target.closest('.bubble');
+  if (!b || b.classList.contains('deleted')) return;
+  e.preventDefault();
+  openMsgMenu(b, e.clientX, e.clientY);
+});
+let pressTimer = null;
+let suppressClick = false;
+msgBox.addEventListener('pointerdown', (e) => {
+  const b = e.target.closest('.bubble');
+  if (!b || b.classList.contains('deleted')) return;
+  if (e.target.closest('video, audio, button')) return; // ضوابط الوسائط لها تفاعلها
+  const x = e.clientX, y = e.clientY;
+  pressTimer = setTimeout(() => { suppressClick = true; openMsgMenu(b, x, y); }, 600);
+});
+for (const ev of ['pointerup', 'pointercancel', 'pointermove']) {
+  msgBox.addEventListener(ev, () => { if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; } }, { passive: true });
+}
+msgBox.addEventListener('click', (e) => {
+  if (suppressClick) { suppressClick = false; e.preventDefault(); e.stopPropagation(); }
+}, true);
+document.addEventListener('pointerdown', (e) => {
+  if (!$('msg-menu').hidden && !e.target.closest('#msg-menu') && !e.target.closest('.bubble')) closeMsgMenu();
+});
+
+// ---------- رفع الملفات وإرسال الوسائط ----------
+let uploading = false;
+
+async function uploadFile(blob, name) {
+  uploading = true;
+  $('upload-status').hidden = false;
+  $('attach-btn').disabled = true;
+  $('mic-btn').disabled = true;
+  try {
+    const res = await fetch('/api/upload', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer ' + token,
+        'Content-Type': (blob.type || '').split(';')[0] || 'application/octet-stream',
+        'X-File-Name': encodeURIComponent(name || 'file'),
+      },
+      body: blob, // البايتات الأصلية كما هي — بلا أي ضغط أو إعادة ترميز
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'فشل الرفع');
+    return data;
+  } finally {
+    uploading = false;
+    $('upload-status').hidden = true;
+    $('attach-btn').disabled = false;
+    $('mic-btn').disabled = false;
+  }
+}
+function sendMediaMessage(kind, fileId, durationSec) {
+  if (!currentChat) return;
+  const payload = { kind, fileId, durationSec: durationSec || 0 };
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'send', to: currentChat, ...payload }));
+    setTimeout(() => { if (currentChat) refreshChatTicks(); }, 150);
+  } else {
+    api('/api/messages/' + encodeURIComponent(currentChat), { method: 'POST', body: JSON.stringify(payload) })
+      .then(({ message }) => appendMessage(message))
+      .catch((err) => alert(err.message));
+  }
+}
+function probeVideoDuration(file) {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(file);
+    const v = document.createElement('video');
+    v.preload = 'metadata';
+    const done = (d) => { URL.revokeObjectURL(url); resolve(d); };
+    v.onloadedmetadata = () => done(isFinite(v.duration) ? Math.round(v.duration) : 0);
+    v.onerror = () => done(0);
+    setTimeout(() => done(0), 3000);
+    v.src = url;
+  });
+}
+$('attach-btn').onclick = () => { if (!uploading) $('file-input').click(); };
+$('file-input').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file || !currentChat) return;
+  const kind = file.type.startsWith('video/') ? 'video' : 'image';
+  let durationSec = 0;
+  if (kind === 'video') durationSec = await probeVideoDuration(file).catch(() => 0);
+  try {
+    const up = await uploadFile(file, file.name);
+    sendMediaMessage(kind, up.fileId, durationSec);
+  } catch (err) { alert(err.message || 'فشل رفع الملف'); }
+});
+
+// ---------- تسجيل رسالة صوتية ----------
+let recorder = null, recChunks = [], recStream = null, recStartedAt = 0, recTimerInt = null, recSendOnStop = false;
+
+async function startRecording() {
+  if (recorder || uploading) return;
+  let stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  catch { alert('تعذّر الوصول إلى الميكروفون. تحقّق من أذونات المتصفح ثم حاول مرة أخرى.'); return; }
+  recStream = stream;
+  recChunks = [];
+  try { recorder = new MediaRecorder(stream); } catch { recorder = null; }
+  if (!recorder) {
+    stream.getTracks().forEach((t) => t.stop());
+    recStream = null;
+    alert('التسجيل الصوتي غير مدعوم في هذا المتصفح');
+    return;
+  }
+  recorder.ondataavailable = (e) => { if (e.data && e.data.size) recChunks.push(e.data); };
+  recorder.onstop = finishRecording;
+  recorder.start();
+  recStartedAt = Date.now();
+  $('rec-time').textContent = '00:00';
+  $('recording-bar').hidden = false;
+  recTimerInt = setInterval(() => { $('rec-time').textContent = fmtCallDuration(Math.floor((Date.now() - recStartedAt) / 1000)); }, 250);
+}
+function stopRecording(send) {
+  if (!recorder) return;
+  recSendOnStop = send;
+  try { recorder.stop(); } catch { finishRecording(); }
+}
+async function finishRecording() {
+  if (recTimerInt) { clearInterval(recTimerInt); recTimerInt = null; }
+  $('recording-bar').hidden = true;
+  if (recStream) { recStream.getTracks().forEach((t) => t.stop()); recStream = null; }
+  const shouldSend = recSendOnStop;
+  const chunks = recChunks; recChunks = [];
+  const rec = recorder; recorder = null; recSendOnStop = false;
+  if (!shouldSend || !chunks.length || !currentChat) return;
+  const type = (rec && rec.mimeType) || 'audio/webm';
+  const blob = new Blob(chunks, { type });
+  const durationSec = Math.max(1, Math.round((Date.now() - recStartedAt) / 1000));
+  const ext = type.includes('mp4') ? 'm4a' : type.includes('ogg') ? 'ogg' : type.includes('mpeg') ? 'mp3' : type.includes('wav') ? 'wav' : 'webm';
+  try {
+    const up = await uploadFile(blob, 'voice.' + ext);
+    sendMediaMessage('voice', up.fileId, durationSec);
+  } catch (err) { alert(err.message || 'فشل رفع التسجيل'); }
+}
+$('mic-btn').onclick = startRecording;
+$('rec-cancel').onclick = () => stopRecording(false);
+$('rec-send').onclick = () => stopRecording(true);
 
 function updatePresenceUI() {
   if (!currentChat) return;
@@ -319,6 +559,7 @@ function showCallOverlay(mode) {
   $('call-mute').textContent = '🎤 كتم';
   $('call-camera').classList.remove('off');
   $('call-camera').textContent = '📷 الكاميرا';
+  updateSpeakerBtn();
   if (mode === 'outgoing') $('call-status').textContent = 'جارٍ الاتصال…';
   else if (mode === 'incoming') $('call-status').textContent = isVideo ? 'مكالمة فيديو واردة' : 'مكالمة صوتية واردة';
   else $('call-status').textContent = '00:00';
@@ -337,6 +578,7 @@ function cleanupCall() {
   $('call-overlay').hidden = true;
   $('remote-video').srcObject = null;
   $('local-video').srcObject = null;
+  $('remote-audio').srcObject = null;
 }
 function endCallWithMessage(msg) {
   if (!call) { $('call-overlay').hidden = true; return; }
@@ -351,6 +593,7 @@ function endCallWithMessage(msg) {
       $('call-overlay').hidden = true;
       $('remote-video').srcObject = null;
       $('local-video').srcObject = null;
+      $('remote-audio').srcObject = null;
     }
   }, 1600);
 }
@@ -394,8 +637,16 @@ function setupPeerConnection() {
     if (e.candidate && call) callSend({ type: 'call_ice', to: call.peer, candidate: e.candidate.toJSON() });
   };
   pc.ontrack = (e) => {
-    $('remote-video').srcObject = e.streams[0];
-    if (call && call.type === 'video') $('remote-video').hidden = false;
+    const stream = e.streams[0];
+    if (call && call.type === 'video') {
+      // فيديو: الصوت والصورة عبر عنصر الفيديو
+      $('remote-video').srcObject = stream;
+      $('remote-video').hidden = false;
+    } else {
+      // صوت فقط: عبر عنصر صوت مخصص ليتمكن setSinkId من تبديل مخرج الصوت
+      $('remote-audio').srcObject = stream;
+    }
+    applyAudioOutput(false);
   };
   pc.onconnectionstatechange = () => {
     if (!call || call.pc !== pc) return;
@@ -429,6 +680,7 @@ async function startCall(type) {
     peer, type, role: 'caller', status: 'outgoing',
     pc: null, localStream: stream, connectedAt: null, acceptedAt: null,
     timer: null, ringTimeout: null, pendingIce: [],
+    speaker: type === 'video', // الفيديو: مكبر صوت افتراضياً — الصوتية: سماعة الهاتف
   };
   setupPeerConnection();
   showCallOverlay('outgoing');
@@ -453,6 +705,7 @@ function handleCallEvent(data) {
         role: 'callee', status: 'incoming',
         pc: null, localStream: null, connectedAt: null, acceptedAt: null,
         timer: null, ringTimeout: null, pendingIce: [],
+        speaker: data.callType === 'video',
       };
       showCallOverlay('incoming');
       startRingtone();
@@ -570,6 +823,49 @@ $('call-camera').onclick = () => {
   tracks.forEach((t) => { t.enabled = enabled; });
   $('call-camera').classList.toggle('off', !enabled);
   $('call-camera').textContent = enabled ? '📷 الكاميرا' : '🚫 الكاميرا';
+};
+
+// ----- مخرج الصوت: سماعة الهاتف / مكبر الصوت (setSinkId حيثما يدعمه المتصفح) -----
+let callToastTimer = null;
+function showCallToast(msg) {
+  const t = $('call-toast');
+  t.textContent = msg;
+  t.hidden = false;
+  if (callToastTimer) clearTimeout(callToastTimer);
+  callToastTimer = setTimeout(() => { t.hidden = true; }, 3200);
+}
+function updateSpeakerBtn() {
+  if (!call) return;
+  $('call-speaker').textContent = call.speaker ? '🔊 مكبر الصوت' : '📞 سماعة الهاتف';
+  $('call-speaker').classList.toggle('off', !call.speaker);
+}
+/** تطبيق مخرج الصوت الحالي على العنصر الذي يشغّل صوت الطرف الآخر.
+ *  userInitiated=true يعني أن المستخدم ضغط الزر الآن — عندها فقط نعرض تنبيهاً عند عدم الدعم. */
+async function applyAudioOutput(userInitiated) {
+  if (!call) return;
+  const el = call.type === 'video' ? $('remote-video') : $('remote-audio');
+  const fail = () => {
+    if (userInitiated) showCallToast('تبديل السماعة غير مدعوم على هذا المتصفح — الصوت يتبع إعدادات الهاتف');
+  };
+  if (!el || typeof el.setSinkId !== 'function') return fail();
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const outs = devices.filter((d) => d.kind === 'audiooutput');
+    if (call.speaker) {
+      const spk = outs.find((d) => /speaker|مكبر/i.test(d.label || ''));
+      await el.setSinkId(spk ? spk.deviceId : ''); // '' = الجهاز الافتراضي (المكبر عادة)
+    } else {
+      const ear = outs.find((d) => /earpiece|receiver|سماعة/i.test(d.label || ''));
+      if (!ear) return fail();
+      await el.setSinkId(ear.deviceId);
+    }
+  } catch { fail(); }
+}
+$('call-speaker').onclick = () => {
+  if (!call) return;
+  call.speaker = !call.speaker;
+  updateSpeakerBtn();
+  applyAudioOutput(true);
 };
 
 // ---------- إقلاع ----------

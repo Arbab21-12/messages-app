@@ -66,10 +66,28 @@
   </header>
   <div id="messages" class="messages"></div>
   <form id="send-form" class="composer">
+    <button id="attach-btn" type="button" class="icon-btn" title="إرفاق صورة أو فيديو">📎</button>
+    <input id="file-input" type="file" accept="image/*,video/*" hidden>
     <input id="message-input" type="text" placeholder="اكتب رسالة…" autocomplete="off">
+    <button id="mic-btn" type="button" class="icon-btn" title="تسجيل رسالة صوتية">🎤</button>
     <button type="submit">إرسال</button>
   </form>
+  <div id="recording-bar" class="recording-bar" hidden>
+    <span class="rec-dot"></span>
+    <span id="rec-time">00:00</span>
+    <span class="rec-label">جارٍ التسجيل…</span>
+    <button id="rec-cancel" type="button" class="ghost">إلغاء</button>
+    <button id="rec-send" type="button">إرسال</button>
+  </div>
+  <div id="upload-status" class="upload-status" hidden>جارٍ الرفع…</div>
 </section>
+
+<!-- قائمة حذف الرسالة (ضغط مطوّل أو نقر يمين على الفقاعة) -->
+<div id="msg-menu" class="msg-menu" hidden>
+  <button id="menu-del-everyone" type="button">حذف لدى الجميع</button>
+  <button id="menu-del-me" type="button">حذف لديّ</button>
+  <button id="menu-cancel" type="button">إلغاء</button>
+</div>
 
 <!-- واجهة المكالمة (صادرة / واردة / جارية) -->
 <div id="call-overlay" class="call-overlay" hidden>
@@ -91,8 +109,11 @@
   <div id="call-controls" class="call-actions" hidden>
     <button id="call-mute" type="button" class="call-btn ctrl">🎤 كتم</button>
     <button id="call-camera" type="button" class="call-btn ctrl">📷 الكاميرا</button>
+    <button id="call-speaker" type="button" class="call-btn ctrl">📞 سماعة الهاتف</button>
     <button id="call-end" type="button" class="call-btn reject">📵 إنهاء</button>
   </div>
+  <audio id="remote-audio" autoplay hidden></audio>
+  <div id="call-toast" class="call-toast" hidden></div>
 </div>
 
 <script src="/app.js"></script>
