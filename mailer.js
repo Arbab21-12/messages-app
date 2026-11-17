@@ -53,6 +53,8 @@ class SmtpConn {
   _fail(err) {
     if (this.dead) return;
     this.dead = err;
+    // تشخيص: يُسجَّل سبب فشل الاتصال فقط (لا بيانات اعتماد إطلاقاً)
+    console.error('[mail] connection failed:', (err && (err.code || err.message)) || err);
     for (const w of this.lineWaiters.splice(0)) w.reject(err);
   }
   readLine() {
@@ -158,7 +160,13 @@ async function sendMail({ to, subject, text }) {
     return;
   }
   if (!SMTP_USER || !SMTP_PASS) throw new Error('إرسال البريد غير مفعّل');
-  await sendViaSmtp({ to, subject, text });
+  try {
+    await sendViaSmtp({ to, subject, text });
+  } catch (err) {
+    // تشخيص: خطوة الفشل وردّ الخادم فقط — لا كلمات سر ولا رموز في السجل
+    console.error('[mail] send failed:', (err && err.message) || err);
+    throw err;
+  }
 }
 
 module.exports = { mailEnabled, sendMail };
