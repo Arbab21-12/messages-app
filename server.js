@@ -14,10 +14,14 @@ const { WebSocketServer } = require('ws');
 const store = require('./store');
 
 const PORT = process.env.PORT || 3000;
-// اسم المستخدم: يبدأ بحرف أو رقم، ثم حروف/أرقام و _ . - — الطول الكلي 3–24
-const USERNAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{2,23}$/;
+// اسم المستخدم: يبدأ بحرف أو رقم، ثم حروف/أرقام و _ . - — الطول الكلي 1–24
+// (حرف واحد مثل "A" أو "7" صالح). الفرادة بمطابقة دقيقة لحالة الأحرف:
+// «omer» و«Omer» اسمان مختلفان يمكن أن يتعايشا كحسابين منفصلين.
+const USERNAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,23}$/;
 const USERNAME_ERROR = 'اسم المستخدم يجب أن يبدأ بحرف أو رقم، ويمكن أن يحتوي على حروف وأرقام و _ . - فقط';
 const USERNAME_TAKEN_ERROR = 'اسم المستخدم هذا مستخدم من قبل، اختر اسماً آخر';
+const USERNAME_RESERVED_ERROR = 'هذا الاسم محجوز مؤقتاً لصاحبه السابق، يصبح متاحاً بعد انتهاء الحجز (٣ أيام من تغييره)';
+const NAME_HOLD_MS = 3 * 24 * 60 * 60 * 1000; // حجز الاسم المُخلى: ٣ أيام
 
 // قوة كلمة المرور (عند التسجيل فقط): 4 حروف على الأقل + رقم + رمز
 function passwordError(password) {
@@ -45,7 +49,7 @@ function newToken() {
   return crypto.randomBytes(32).toString('hex');
 }
 function publicUser(u) {
-  return { id: u.id, username: u.username, createdAt: u.createdAt };
+  return { id: u.id, username: u.username, createdAt: u.createdAt, avatar: store.avatarUrl(u) };
 }
 function publicMessage(m) {
   const from = store.getUserById(m.fromId);
@@ -140,6 +144,10 @@ app.post('/api/register', (req, res) => {
   if (store.getUserByUsername(name)) {
     return res.status(409).json({ error: USERNAME_TAKEN_ERROR });
   }
+  // اسم مُخلى حديثاً وما زال محجوزاً لصاحبه السابق (٣ أيام) — لا يُسجَّل به حساب جديد
+  if (store.getNameReservation(name)) {
+    return res.status(409).json({ error: USERNAME_RESERVED_ERROR });
+  }
   const { salt, hash } = hashPassword(String(password));
   const user = { id: crypto.randomUUID(), username: name, salt, hash, createdAt: Date.now() };
   store.createUser(user);
@@ -167,6 +175,53 @@ app.post('/api/logout', requireAuth, (req, res) => {
 
 app.get('/api/me', requireAuth, (req, res) => res.json({ user: publicUser(req.user) }));
 
+// ---------- الملف الشخصي: الصورة وتغيير الاسم ----------
+// الصورة الشخصية: ملف صورة رفعه المستخدم نفسه عبر /api/upload — يُحفظ مرجعه على سجلّه.
+app.post('/api/me/avatar', requireAuth, (req, res) => {
+  const fileId = String((req.body || {}).fileId || '');
+  const up = fileId ? store.getUpload(fileId) : null;
+  if (!up) return res.status(400).json({ error: 'ملف غير صالح' });
+  if (up.ownerId !== req.user.id) return res.status(403).json({ error: 'لا يمكنك استخدام ملف لا يخصّك صورةً شخصية' });
+  if (!String(up.mime || '').startsWith('image/')) {
+    return res.status(400).json({ error: 'الصورة الشخصية يجب أن تكون ملف صورة' });
+  }
+  req.user.avatarFileId = fileId;
+  store.saveUser();
+  res.json({ user: publicUser(req.user) });
+});
+
+// تغيير اسم المستخدم: نفس قواعد التسجيل (1–24، يبدأ بحرف/رقم، فرادة دقيقة لحالة الأحرف).
+// الاسم القديم يُحجز لصاحبه ٣ أيام: لا يستطيع غيره أخذه (تسجيلاً أو تغييراً) قبل انتهاء
+// الحجز، ويستطيع صاحبه الرجوع إليه في أي وقت خلالها. الهوية ثابتة بالمعرّف (id) —
+// الرسائل والمحادثات والجلسة مرتبطة بالمعرّف لا بالاسم، فتتبع المستخدم اسمه الجديد
+// تلقائياً في كل مكان دون أي ترحيل للبيانات.
+app.post('/api/me/username', requireAuth, (req, res) => {
+  const name = String((req.body || {}).username || '').trim();
+  if (!USERNAME_RE.test(name)) {
+    return res.status(400).json({ error: USERNAME_ERROR });
+  }
+  const me = req.user;
+  if (name === me.username) {
+    return res.json({ user: publicUser(me) }); // نفس الاسم الحالي — لا تغيير
+  }
+  const existing = store.getUserByUsername(name);
+  if (existing && existing.id !== me.id) {
+    return res.status(409).json({ error: USERNAME_TAKEN_ERROR });
+  }
+  const reservation = store.getNameReservation(name);
+  if (reservation && reservation.ownerId !== me.id) {
+    return res.status(409).json({ error: USERNAME_RESERVED_ERROR });
+  }
+  const oldName = me.username;
+  if (reservation) store.removeNameReservation(name); // استرجاع اسمي المحجوز لي — يُستهلك الحجز
+  me.username = name;
+  store.saveUser();
+  store.addNameReservation(oldName, me.id, Date.now() + NAME_HOLD_MS);
+  // إعادة بثّ الحضور بالأسماء الجديدة حتى تتحدث القوائم عند الجميع
+  broadcastPresence();
+  res.json({ user: publicUser(me) });
+});
+
 // ---------- دليل المستخدمين ----------
 app.get('/api/users', requireAuth, (req, res) => {
   res.json({ users: store.listUsers(req.user.id, req.query.q || '') });
@@ -193,6 +248,7 @@ app.get('/api/conversations', requireAuth, (req, res) => {
     const last = entry.messages[entry.messages.length - 1];
     conversations.push({
       username: other.username,
+      avatar: store.avatarUrl(other),
       lastMessage: last ? publicMessage(last) : null,
       unread: entry.unread,
     });
@@ -486,7 +542,7 @@ function handleCallSignal(ws, me, data) {
     activeCalls.set(call.id, call);
     callByUser.set(me.id, call.id);
     callByUser.set(to.id, call.id);
-    sendToUser(to.id, { type: 'call_invite', from: me.username, callType });
+    sendToUser(to.id, { type: 'call_invite', from: me.username, callType, avatar: store.avatarUrl(me) });
     return;
   }
 

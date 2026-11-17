@@ -4,10 +4,11 @@
  * حالياً: ملف JSON واحد (data.json) مع كتابة ذرّية (ملف مؤقت + إعادة تسمية).
  * لاحقاً يمكن استبدال هذه الوحدة فقط بـ Postgres دون تغيير بقية الخادم،
  * لأن بقية الكود يتعامل مع الدوال التالية فقط:
- *   getUserByUsername, getUserById, createUser,
+ *   getUserByUsername, getUserById, createUser, saveUser,
  *   createSession, getUserIdByToken, deleteSession,
  *   listUsers, addMessage, getConversation, markConversationRead,
- *   markDelivered, getUndeliveredFor
+ *   markDelivered, getUndeliveredFor,
+ *   getNameReservation, addNameReservation, removeNameReservation
  */
 const fs = require('fs');
 const path = require('path');
@@ -15,7 +16,7 @@ const path = require('path');
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'data.json');
 
-let db = { users: [], messages: [], sessions: {}, uploads: {} };
+let db = { users: [], messages: [], sessions: {}, uploads: {}, nameReservations: [] };
 
 function load() {
   try {
@@ -26,9 +27,10 @@ function load() {
       messages: Array.isArray(parsed.messages) ? parsed.messages : [],
       sessions: parsed.sessions && typeof parsed.sessions === 'object' ? parsed.sessions : {},
       uploads: parsed.uploads && typeof parsed.uploads === 'object' ? parsed.uploads : {},
+      nameReservations: Array.isArray(parsed.nameReservations) ? parsed.nameReservations : [],
     };
   } catch {
-    db = { users: [], messages: [], sessions: {}, uploads: {} };
+    db = { users: [], messages: [], sessions: {}, uploads: {}, nameReservations: [] };
   }
 }
 
@@ -42,9 +44,12 @@ function save() {
 load();
 
 // ---------- المستخدمون ----------
+// الهوية والفرادة بمطابقة دقيقة لحالة الأحرف (exact match): «omer» و«Omer» حسابان مختلفان،
+// والدخول يتطلب نفس حالة الأحرف المسجّلة. البحث في الدليل وحده يبقى غير حسّاس للحالة
+// (مطابقة جزئية) لتسهيل إيجاد الأشخاص — دون أن يؤثر على الهوية.
 function getUserByUsername(username) {
-  const u = String(username).toLowerCase();
-  return db.users.find((x) => x.username.toLowerCase() === u) || null;
+  const u = String(username);
+  return db.users.find((x) => x.username === u) || null;
 }
 function getUserById(id) {
   return db.users.find((x) => x.id === id) || null;
@@ -54,13 +59,45 @@ function createUser(user) {
   save();
   return user;
 }
+/** حفظ أي تعديل أُجري على سجل مستخدم موجود (صورة شخصية/تغيير اسم…) — يُعدَّل في مكانه ثم تُستدعى هذه. */
+function saveUser() {
+  save();
+}
+function avatarUrl(u) {
+  return u && u.avatarFileId ? '/files/' + u.avatarFileId : null;
+}
 function listUsers(excludeId, query) {
   const q = query ? String(query).toLowerCase() : '';
   return db.users
     .filter((x) => x.id !== excludeId)
     .filter((x) => !q || x.username.toLowerCase().includes(q))
-    .map((x) => ({ id: x.id, username: x.username, createdAt: x.createdAt }))
+    .map((x) => ({ id: x.id, username: x.username, createdAt: x.createdAt, avatar: avatarUrl(x) }))
     .sort((a, b) => a.username.localeCompare(b.username));
+}
+
+// ---------- حجوزات الأسماء (اسم مُخلى عند تغيير الاسم — محجوز لصاحبه السابق ٣ أيام) ----------
+// كل حجز: { name, ownerId, until } — المطابقة دقيقة لحالة الأحرف، والحجوزات المنتهية
+// تُنظَّف بتكاسل (lazily) عند أول قراءة/كتابة.
+function pruneReservations() {
+  const now = Date.now();
+  const before = db.nameReservations.length;
+  db.nameReservations = db.nameReservations.filter((r) => r && r.until > now);
+  if (db.nameReservations.length !== before) save();
+}
+function getNameReservation(name) {
+  pruneReservations();
+  return db.nameReservations.find((r) => r.name === String(name)) || null;
+}
+function addNameReservation(name, ownerId, until) {
+  pruneReservations();
+  db.nameReservations = db.nameReservations.filter((r) => r.name !== String(name));
+  db.nameReservations.push({ name: String(name), ownerId, until });
+  save();
+}
+function removeNameReservation(name) {
+  const before = db.nameReservations.length;
+  db.nameReservations = db.nameReservations.filter((r) => r.name !== String(name));
+  if (db.nameReservations.length !== before) save();
 }
 
 // ---------- الجلسات ----------
@@ -153,7 +190,12 @@ module.exports = {
   getUserByUsername,
   getUserById,
   createUser,
+  saveUser,
+  avatarUrl,
   listUsers,
+  getNameReservation,
+  addNameReservation,
+  removeNameReservation,
   createSession,
   getUserIdByToken,
   deleteSession,
