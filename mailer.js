@@ -4,12 +4,14 @@
  * اختيار وسيلة الإرسال (بالأولوية):
  *  أ) MAIL_OUTBOX مضبوط (اختبار/تطوير): تُلحق كل رسالة كسطر JSON
  *     {to, subject, text} في ذلك الملف وتُعدّ مُرسلة.
- *  ب) BREVO_API_KEY مضبوط: إرسال عبر واجهة Brevo البرمجية (HTTPS — المنفذ
+ *  ب) MAILJET_API_KEY + MAILJET_API_SECRET مضبوطان: إرسال عبر واجهة Mailjet
+ *     البرمجية (HTTPS). المُرسِل: MAIL_FROM، أو SMTP_USER عند غيابه.
+ *  ج) BREVO_API_KEY مضبوط: إرسال عبر واجهة Brevo البرمجية (HTTPS — المنفذ
  *     443 لا تحجبه بيئات الاستضافة التي تحجب منافذ SMTP الصادرة).
  *     المُرسِل: MAIL_FROM، أو SMTP_USER عند غيابه.
- *  ج) SMTP_USER + SMTP_PASS مضبوطان: إرسال SMTP حقيقي (Gmail افتراضياً) —
+ *  د) SMTP_USER + SMTP_PASS مضبوطان: إرسال SMTP حقيقي (Gmail افتراضياً) —
  *     TLS ضمني على المنفذ 465، أو STARTTLS على 587 عند ضبط SMTP_PORT=587.
- *  د) غير ذلك: البريد معطّل — mailEnabled() ترجع false.
+ *  هـ) غير ذلك: البريد معطّل — mailEnabled() ترجع false.
  */
 const fs = require('fs');
 const net = require('net');
@@ -24,10 +26,13 @@ const SMTP_PASS = process.env.SMTP_PASS || '';
 const MAIL_OUTBOX = process.env.MAIL_OUTBOX || '';
 const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
 const BREVO_API_URL = process.env.BREVO_API_URL || 'https://api.brevo.com/v3/smtp/email';
+const MAILJET_API_KEY = process.env.MAILJET_API_KEY || '';
+const MAILJET_API_SECRET = process.env.MAILJET_API_SECRET || '';
+const MAILJET_API_URL = process.env.MAILJET_API_URL || 'https://api.mailjet.com/v3.1/send';
 const MAIL_FROM = process.env.MAIL_FROM || '';
 
 function mailEnabled() {
-  return !!MAIL_OUTBOX || !!BREVO_API_KEY || !!(SMTP_USER && SMTP_PASS);
+  return !!MAIL_OUTBOX || !!(MAILJET_API_KEY && MAILJET_API_SECRET) || !!BREVO_API_KEY || !!(SMTP_USER && SMTP_PASS);
 }
 
 // ---------- عميل SMTP مصغّر ----------
@@ -161,6 +166,69 @@ async function sendViaSmtp({ to, subject, text }) {
   }
 }
 
+// ---------- إرسال عبر واجهة Mailjet البرمجية (HTTPS) ----------
+// POST JSON إلى MAILJET_API_URL بمصادقة Basic (مفتاح API + سرّه). يُختار
+// بروتوكول الطلب من رابط الواجهة نفسه (https افتراضياً؛ http مسموح لاختبار
+// وهمي محلي فقط). النجاح: HTTP 200/201 و — عند وجود حقل Status في الردّ —
+// قيمته 'success'. لا تُسجَّل المفاتيح ولا ترويسة المصادقة ولا نص الرسالة.
+async function sendViaMailjet({ to, subject, text }) {
+  const from = MAIL_FROM || SMTP_USER;
+  if (!from) {
+    const err = new Error('بريد المُرسِل غير مضبوط: اضبط MAIL_FROM (أو SMTP_USER) لاستخدام Mailjet');
+    console.error('[mail] mailjet failed:', err.message);
+    throw err;
+  }
+  const payload = JSON.stringify({
+    Messages: [{
+      From: { Email: from, Name: 'رسائلي' },
+      To: [{ Email: to }],
+      Subject: subject,
+      TextPart: text,
+    }],
+  });
+  const url = new URL(MAILJET_API_URL);
+  const lib = url.protocol === 'http:' ? http : https;
+  const auth = 'Basic ' + Buffer.from(`${MAILJET_API_KEY}:${MAILJET_API_SECRET}`, 'utf8').toString('base64');
+  const { status, body } = await new Promise((resolve, reject) => {
+    const req = lib.request({
+      method: 'POST',
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'http:' ? 80 : 443),
+      path: url.pathname + url.search,
+      headers: {
+        Authorization: auth,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+      timeout: 15000,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.on('timeout', () => req.destroy(new Error('انتهت مهلة اتصال Mailjet')));
+    req.on('error', reject);
+    req.write(payload);
+    req.end();
+  });
+  // استخراج حالة الرسالة وملخص الخطأ من الردّ (حقول ErrorMessage لا أسرار فيها)
+  let msgStatus = null;
+  let detail = '';
+  try {
+    const parsed = JSON.parse(body || '{}');
+    const m0 = Array.isArray(parsed.Messages) ? parsed.Messages[0] : null;
+    if (m0 && typeof m0.Status === 'string') msgStatus = m0.Status;
+    const errs = m0 && Array.isArray(m0.Errors) ? m0.Errors : [];
+    detail = errs.map((e) => e && e.ErrorMessage).filter(Boolean).join('; ')
+      || (parsed.ErrorMessage || '');
+  } catch {}
+  if ((status === 200 || status === 201) && (msgStatus === null || msgStatus === 'success')) return;
+  if (!detail) detail = (body || '').slice(0, 200);
+  console.error('[mail] mailjet failed:', status, detail);
+  throw new Error(`فشل إرسال Mailjet: HTTP ${status}${detail ? ' — ' + detail : ''}`);
+}
+
 // ---------- إرسال عبر واجهة Brevo البرمجية (HTTPS) ----------
 // POST JSON إلى BREVO_API_URL بترويسة api-key. يُختار بروتوكول الطلب من
 // رابط الواجهة نفسه (https افتراضياً؛ http مسموح لاختبار وهمي محلي فقط).
@@ -221,9 +289,12 @@ async function sendMail({ to, subject, text }) {
     fs.appendFileSync(MAIL_OUTBOX, JSON.stringify({ to, subject, text }) + '\n', 'utf8');
     return;
   }
-  if (!BREVO_API_KEY && !(SMTP_USER && SMTP_PASS)) throw new Error('إرسال البريد غير مفعّل');
+  if (!(MAILJET_API_KEY && MAILJET_API_SECRET) && !BREVO_API_KEY && !(SMTP_USER && SMTP_PASS)) {
+    throw new Error('إرسال البريد غير مفعّل');
+  }
   try {
-    if (BREVO_API_KEY) await sendViaBrevo({ to, subject, text });
+    if (MAILJET_API_KEY && MAILJET_API_SECRET) await sendViaMailjet({ to, subject, text });
+    else if (BREVO_API_KEY) await sendViaBrevo({ to, subject, text });
     else await sendViaSmtp({ to, subject, text });
   } catch (err) {
     // تشخيص: خطوة الفشل وردّ الخادم فقط — لا كلمات سر ولا رموز في السجل
