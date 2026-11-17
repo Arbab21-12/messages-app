@@ -1,25 +1,33 @@
 'use strict';
 /**
- * إرسال البريد — دون أي اعتماديات خارجية (node:net / node:tls فقط).
- * اختيار وسيلة الإرسال:
+ * إرسال البريد — دون أي اعتماديات خارجية (مكتبات Node المدمجة فقط).
+ * اختيار وسيلة الإرسال (بالأولوية):
  *  أ) MAIL_OUTBOX مضبوط (اختبار/تطوير): تُلحق كل رسالة كسطر JSON
  *     {to, subject, text} في ذلك الملف وتُعدّ مُرسلة.
- *  ب) SMTP_USER + SMTP_PASS مضبوطان: إرسال SMTP حقيقي (Gmail افتراضياً) —
+ *  ب) BREVO_API_KEY مضبوط: إرسال عبر واجهة Brevo البرمجية (HTTPS — المنفذ
+ *     443 لا تحجبه بيئات الاستضافة التي تحجب منافذ SMTP الصادرة).
+ *     المُرسِل: MAIL_FROM، أو SMTP_USER عند غيابه.
+ *  ج) SMTP_USER + SMTP_PASS مضبوطان: إرسال SMTP حقيقي (Gmail افتراضياً) —
  *     TLS ضمني على المنفذ 465، أو STARTTLS على 587 عند ضبط SMTP_PORT=587.
- *  ج) غير ذلك: البريد معطّل — mailEnabled() ترجع false.
+ *  د) غير ذلك: البريد معطّل — mailEnabled() ترجع false.
  */
 const fs = require('fs');
 const net = require('net');
 const tls = require('tls');
+const http = require('http');
+const https = require('https');
 
 const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
 const SMTP_PORT = Number(process.env.SMTP_PORT || 465);
 const SMTP_USER = process.env.SMTP_USER || '';
 const SMTP_PASS = process.env.SMTP_PASS || '';
 const MAIL_OUTBOX = process.env.MAIL_OUTBOX || '';
+const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
+const BREVO_API_URL = process.env.BREVO_API_URL || 'https://api.brevo.com/v3/smtp/email';
+const MAIL_FROM = process.env.MAIL_FROM || '';
 
 function mailEnabled() {
-  return !!MAIL_OUTBOX || !!(SMTP_USER && SMTP_PASS);
+  return !!MAIL_OUTBOX || !!BREVO_API_KEY || !!(SMTP_USER && SMTP_PASS);
 }
 
 // ---------- عميل SMTP مصغّر ----------
@@ -153,15 +161,70 @@ async function sendViaSmtp({ to, subject, text }) {
   }
 }
 
+// ---------- إرسال عبر واجهة Brevo البرمجية (HTTPS) ----------
+// POST JSON إلى BREVO_API_URL بترويسة api-key. يُختار بروتوكول الطلب من
+// رابط الواجهة نفسه (https افتراضياً؛ http مسموح لاختبار وهمي محلي فقط).
+// لا يُسجَّل مفتاح API ولا نص الرسالة/الرمز في أي مكان.
+async function sendViaBrevo({ to, subject, text }) {
+  const from = MAIL_FROM || SMTP_USER;
+  if (!from) {
+    const err = new Error('بريد المُرسِل غير مضبوط: اضبط MAIL_FROM (أو SMTP_USER) لاستخدام Brevo');
+    console.error('[mail] brevo failed:', err.message);
+    throw err;
+  }
+  const payload = JSON.stringify({
+    sender: { email: from, name: 'رسائلي' },
+    to: [{ email: to }],
+    subject,
+    textContent: text,
+  });
+  const url = new URL(BREVO_API_URL);
+  const lib = url.protocol === 'http:' ? http : https;
+  const { status, body } = await new Promise((resolve, reject) => {
+    const req = lib.request({
+      method: 'POST',
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'http:' ? 80 : 443),
+      path: url.pathname + url.search,
+      headers: {
+        'api-key': BREVO_API_KEY,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+      timeout: 15000,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.on('timeout', () => req.destroy(new Error('انتهت مهلة اتصال Brevo')));
+    req.on('error', reject);
+    req.write(payload);
+    req.end();
+  });
+  if (status >= 200 && status < 300) return;
+  // ردّ الخطأ من Brevo: حقول code/message فقط (لا أسرار فيها)
+  let detail = '';
+  try {
+    const parsed = JSON.parse(body || '{}');
+    detail = [parsed.code, parsed.message].filter(Boolean).join(': ');
+  } catch {}
+  if (!detail) detail = (body || '').slice(0, 200);
+  console.error('[mail] brevo failed:', status, detail);
+  throw new Error(`فشل إرسال Brevo: HTTP ${status}${detail ? ' — ' + detail : ''}`);
+}
+
 /** إرسال رسالة بريد — ترمي خطأً نظيفاً عند أي فشل (لا يتضمن أي بيانات حساسة). */
 async function sendMail({ to, subject, text }) {
   if (MAIL_OUTBOX) {
     fs.appendFileSync(MAIL_OUTBOX, JSON.stringify({ to, subject, text }) + '\n', 'utf8');
     return;
   }
-  if (!SMTP_USER || !SMTP_PASS) throw new Error('إرسال البريد غير مفعّل');
+  if (!BREVO_API_KEY && !(SMTP_USER && SMTP_PASS)) throw new Error('إرسال البريد غير مفعّل');
   try {
-    await sendViaSmtp({ to, subject, text });
+    if (BREVO_API_KEY) await sendViaBrevo({ to, subject, text });
+    else await sendViaSmtp({ to, subject, text });
   } catch (err) {
     // تشخيص: خطوة الفشل وردّ الخادم فقط — لا كلمات سر ولا رموز في السجل
     console.error('[mail] send failed:', (err && err.message) || err);
