@@ -1,6 +1,7 @@
 // اختبار شامل (End-to-End) — يشغّل الخادم على منفذ اختبار مع مجلد بيانات مؤقت،
 // ثم يتحقق من: التسجيل، رفض التكرار وكلمة المرور الخاطئة، الإرسال اللحظي عبر
-// WebSocket، سجل المحادثة، إشعار القراءة، والرسائل أثناء عدم الاتصال.
+// WebSocket، سجل المحادثة، إشعار القراءة، والرسائل أثناء عدم الاتصال، وقواعد
+// الحساب الجديد (بداية اسم المستخدم وقوة كلمة المرور عند التسجيل فقط).
 // التشغيل: npm test
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -75,17 +76,17 @@ try {
   console.log('الخادم أقلع — بدء الفحوصات:');
 
   // 1) التسجيل
-  const regA = await api('/api/register', { method: 'POST', body: { username: 'omar_test', password: 'pass1234' } });
+  const regA = await api('/api/register', { method: 'POST', body: { username: 'omar_test', password: 'Pass1234!' } });
   check('تسجيل omar_test', regA.status === 201 && !!regA.data.token);
-  const regB = await api('/api/register', { method: 'POST', body: { username: 'sara_test', password: 'pass5678' } });
+  const regB = await api('/api/register', { method: 'POST', body: { username: 'sara_test', password: 'Pass5678!' } });
   check('تسجيل sara_test', regB.status === 201 && !!regB.data.token);
 
   // 2) الرفض
-  const dup = await api('/api/register', { method: 'POST', body: { username: 'omar_test', password: 'whatever1' } });
+  const dup = await api('/api/register', { method: 'POST', body: { username: 'omar_test', password: 'Whatever1!' } });
   check('رفض تسجيل مكرر', dup.status === 409, `status=${dup.status}`);
   const badLogin = await api('/api/login', { method: 'POST', body: { username: 'omar_test', password: 'wrong-pass' } });
   check('رفض كلمة مرور خاطئة', badLogin.status === 401, `status=${badLogin.status}`);
-  const loginA = await api('/api/login', { method: 'POST', body: { username: 'omar_test', password: 'pass1234' } });
+  const loginA = await api('/api/login', { method: 'POST', body: { username: 'omar_test', password: 'Pass1234!' } });
   check('دخول omar_test بكلمة المرور الصحيحة', loginA.status === 200 && !!loginA.data.token);
   const tokA = loginA.data.token, tokB = regB.data.token;
 
@@ -123,7 +124,7 @@ try {
   await wait(400);
   A.send({ type: 'send', to: 'sara_test', text: 'رسالة أثناء غيابك' });
   await wait(300);
-  const loginB2 = await api('/api/login', { method: 'POST', body: { username: 'sara_test', password: 'pass5678' } });
+  const loginB2 = await api('/api/login', { method: 'POST', body: { username: 'sara_test', password: 'Pass5678!' } });
   const histB2 = await api('/api/messages/omar_test', { token: loginB2.data.token });
   check('الرسالة المرسلة أثناء الغياب محفوظة وتظهر في سجل B بعد عودته',
     histB2.data.messages?.some((m) => m.text.includes('أثناء غيابك')));
@@ -182,7 +183,7 @@ try {
   check('سجل الرفض أُضيف مرة واحدة (مرفوضة)', callRecsA2.length === 2 && callRecsA2[1].text.includes('مرفوضة'), `count=${callRecsA2.length}`);
 
   // مسار عدم الاتصال: مستخدم مسجّل لكنه غير متصل → call_unavailable + سجل «فائتة»
-  const regC = await api('/api/register', { method: 'POST', body: { username: 'carol_test', password: 'pass9999' } });
+  const regC = await api('/api/register', { method: 'POST', body: { username: 'carol_test', password: 'Pass9999!' } });
   check('تسجيل carol_test (غير متصلة)', regC.status === 201);
   A.send({ type: 'call_invite', to: 'carol_test', callType: 'voice' });
   const unavail = await A.waitFor((m) => m.type === 'call_unavailable' && m.with === 'carol_test').catch(() => null);
@@ -263,6 +264,34 @@ try {
   check('الرسالة اختفت من سجل B', !histMeB.data.messages?.some((m) => m.id === meId));
   const histMeA = await api('/api/messages/sara_test', { token: tokA });
   check('الرسالة ما زالت في سجل A', histMeA.data.messages?.some((m) => m.id === meId));
+
+  // 11) قواعد الحساب الجديد: اسم مستخدم يبدأ بحرف/رقم + كلمة مرور قوية (عند التسجيل فقط)
+  const STRONG = 'Test1234!';
+  const badStart1 = await api('/api/register', { method: 'POST', body: { username: '_baduser', password: STRONG } });
+  check('اسم يبدأ بـ _ يُرفض 400 مع رسالة البداية', badStart1.status === 400 && (badStart1.data.error || '').includes('يبدأ بحرف أو رقم'), `status=${badStart1.status}`);
+  const badStart2 = await api('/api/register', { method: 'POST', body: { username: '.baduser', password: STRONG } });
+  check('اسم يبدأ بـ . يُرفض 400', badStart2.status === 400, `status=${badStart2.status}`);
+  const digitStart = await api('/api/register', { method: 'POST', body: { username: '9user_x', password: STRONG } });
+  check('اسم يبدأ برقم (9user_x) مع كلمة قوية ينجح', digitStart.status === 201 && !!digitStart.data.token, `status=${digitStart.status}`);
+  const tooShort = await api('/api/register', { method: 'POST', body: { username: 'ab', password: STRONG } });
+  check('اسم قصير (حرفان) يُرفض 400', tooShort.status === 400, `status=${tooShort.status}`);
+  const dupMsg = await api('/api/register', { method: 'POST', body: { username: 'omar_test', password: STRONG } });
+  check('اسم مكرر يُرفض مع رسالة «مستخدم من قبل، اختر اسماً آخر»',
+    dupMsg.status === 409 && (dupMsg.data.error || '').includes('مستخدم من قبل، اختر اسماً آخر'),
+    `status=${dupMsg.status} err=${dupMsg.data.error || ''}`);
+
+  // كلمات مرور ضعيفة على اسم جديد واحد (الرفض لا يُنشئ حساباً، فيُعاد استخدام الاسم)
+  const pwUser = 'pw_user1';
+  const weak1 = await api('/api/register', { method: 'POST', body: { username: pwUser, password: 'ab1!' } });
+  check('كلمة «ab1!» (حروف أقل من ٤) تُرفض 400 مع رسالة كلمة المرور', weak1.status === 400 && (weak1.data.error || '').includes('كلمة المرور'), `status=${weak1.status}`);
+  const weak2 = await api('/api/register', { method: 'POST', body: { username: pwUser, password: 'abcd1234' } });
+  check('كلمة «abcd1234» (بدون رمز) تُرفض 400', weak2.status === 400, `status=${weak2.status}`);
+  const weak3 = await api('/api/register', { method: 'POST', body: { username: pwUser, password: 'abcd!@#$' } });
+  check('كلمة «abcd!@#$» (بدون رقم) تُرفض 400', weak3.status === 400, `status=${weak3.status}`);
+  const strongReg = await api('/api/register', { method: 'POST', body: { username: pwUser, password: 'abcd123!' } });
+  check('كلمة «abcd123!» (٤ حروف + رقم + رمز) تنجح', strongReg.status === 201 && !!strongReg.data.token, `status=${strongReg.status}`);
+  const strongLogin = await api('/api/login', { method: 'POST', body: { username: pwUser, password: 'abcd123!' } });
+  check('الدخول بالحساب ذي الكلمة القوية يعمل', strongLogin.status === 200 && !!strongLogin.data.token, `status=${strongLogin.status}`);
 
   B2.close();
   A.close();
