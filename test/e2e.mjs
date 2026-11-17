@@ -11,7 +11,9 @@
 // إلغاء بقية الجلسات)، وربط بريد مؤكد برمز من ٦ أرقام يُقرأ من صندوق الصادر
 // (MAIL_OUTBOX)، واستعادة كلمة السر بالبريد، وتعطّل نقاط البريد (503) على
 // خادم ثانٍ بلا أي إعداد بريد، وإرسال Brevo عبر HTTPS API على خادم ثالث
-// يقصده خادم HTTP وهمي محلي (حمولة الطلب كاملة + مسار فشل عند ردّ 400).
+// يقصده خادم HTTP وهمي محلي (حمولة الطلب كاملة + مسار فشل عند ردّ 400)،
+// وإرسال Mailjet عبر HTTPS API على خادم رابع يقصده وهمي محلي آخر (ترويسة
+// مصادقة Basic وحمولة Messages + مسار فشل عند ردّ 401).
 // التشغيل: npm test
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -604,7 +606,7 @@ try {
   const dataDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'msgtest-nomail-'));
   const server2 = spawn('node', ['server.js'], {
     cwd: root,
-    env: { ...process.env, PORT: '3220', DATA_DIR: dataDir2, MAIL_OUTBOX: '', SMTP_USER: '', SMTP_PASS: '', ADMIN_USERNAME: '' },
+    env: { ...process.env, PORT: '3220', DATA_DIR: dataDir2, MAIL_OUTBOX: '', SMTP_USER: '', SMTP_PASS: '', ADMIN_USERNAME: '', BREVO_API_KEY: '', MAILJET_API_KEY: '', MAILJET_API_SECRET: '' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   server2.stderr.on('data', (d) => process.stderr.write('[server2] ' + d));
@@ -662,6 +664,7 @@ try {
     env: {
       ...process.env, PORT: '3221', DATA_DIR: dataDir3,
       MAIL_OUTBOX: '', SMTP_USER: '', SMTP_PASS: '', ADMIN_USERNAME: '',
+      MAILJET_API_KEY: '', MAILJET_API_SECRET: '',
       BREVO_API_KEY: 'test-key-123', MAIL_FROM: 'sender@test.dev', BREVO_API_URL: brevoMockUrl,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -721,6 +724,101 @@ try {
     server3.kill();
     brevoMock.close();
     fs.rmSync(dataDir3, { recursive: true, force: true });
+  }
+
+  // 19) إرسال Mailjet عبر HTTPS API: خادم رابع بـ MAILJET_API_KEY/SECRET وبلا
+  // صندوق صادر وبلا Brevo وبلا SMTP، يقصد خادم HTTP وهمياً محلياً يحاكي
+  // Mailjet (يسجّل الطلبات ويردّ 200 بحالة success، أو 401 في وضع الفشل).
+  // دورة ربط البريد كاملة تمرّ عبر هذا المسار.
+  const mjRequests = [];
+  let mjMode = 'ok';
+  const mjMock = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      let reqBody = {};
+      try { reqBody = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); } catch {}
+      mjRequests.push({ method: req.method, url: req.url, headers: req.headers, body: reqBody });
+      if (mjMode === 'ok') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ Messages: [{ Status: 'success', To: [{ Email: 'target@example.com', MessageID: 123456789 }] }] }));
+      } else {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ErrorIdentifier: 'mock-id', ErrorCode: 'mj-0001', StatusCode: 401, ErrorMessage: 'API key authentication failed (mock)' }));
+      }
+    });
+  });
+  await new Promise((r) => mjMock.listen(0, '127.0.0.1', r));
+  const mjMockUrl = `http://127.0.0.1:${mjMock.address().port}/v3.1/send`;
+  const dataDir4 = fs.mkdtempSync(path.join(os.tmpdir(), 'msgtest-mailjet-'));
+  const server4 = spawn('node', ['server.js'], {
+    cwd: root,
+    env: {
+      ...process.env, PORT: '3222', DATA_DIR: dataDir4,
+      MAIL_OUTBOX: '', SMTP_USER: '', SMTP_PASS: '', ADMIN_USERNAME: '', BREVO_API_KEY: '',
+      MAILJET_API_KEY: 'mj-key-123', MAILJET_API_SECRET: 'mj-secret-456',
+      MAIL_FROM: 'sender@test.dev', MAILJET_API_URL: mjMockUrl,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  server4.stderr.on('data', (d) => process.stderr.write('[server4] ' + d));
+  try {
+    const apiMj = async (p, { method = 'GET', token, body } = {}) => {
+      const res = await fetch('http://localhost:3222' + p, {
+        method,
+        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: res.status, data: await res.json().catch(() => ({})) };
+    };
+    let up4 = false;
+    for (let i = 0; i < 50 && !up4; i++) {
+      try { const r = await fetch('http://localhost:3222/api/health'); up4 = r.ok; } catch { await wait(200); }
+    }
+    check('الخادم الرابع (Mailjet) أقلع', up4);
+    const regMj = await apiMj('/api/register', { method: 'POST', body: { username: 'mailjet_user', password: 'Mailjet123!' } });
+    check('تسجيل mailjet_user على خادم Mailjet', regMj.status === 201 && !!regMj.data.token, `status=${regMj.status}`);
+    const tokMj = regMj.data.token;
+    mjRequests.length = 0;
+    const mjSend = await apiMj('/api/me/email', { method: 'POST', token: tokMj, body: { email: 'Target@Example.com' } });
+    check('طلب رمز تأكيد البريد عبر Mailjet ينجح (200)', mjSend.status === 200 && mjSend.data.ok === true,
+      `status=${mjSend.status} err=${mjSend.data.error || ''}`);
+    check('الوهمي استلم طلب POST واحداً فقط إلى مسار Mailjet',
+      mjRequests.length === 1 && mjRequests[0].method === 'POST' && mjRequests[0].url === '/v3.1/send',
+      `count=${mjRequests.length} url=${mjRequests[0]?.url || ''}`);
+    const mjReq = mjRequests[0] || { headers: {}, body: {} };
+    const mjExpectedAuth = 'Basic ' + Buffer.from('mj-key-123:mj-secret-456', 'utf8').toString('base64');
+    check('ترويسة Authorization في طلب Mailjet هي Basic بالمفتاح والسر المضبوطين',
+      mjReq.headers.authorization === mjExpectedAuth,
+      `authorization=${mjReq.headers.authorization || ''}`);
+    const mjMsg = mjReq.body.Messages?.[0] || {};
+    const mjCode = codeFromMail({ text: mjMsg.TextPart || '' });
+    check('حمولة Mailjet: المُرسِل المضبوط واسمه، والمستقبِل الصحيح، ونص فيه رمز من ٦ أرقام',
+      mjMsg.From?.Email === 'sender@test.dev' && mjMsg.From?.Name === 'رسائلي' &&
+      mjMsg.To?.[0]?.Email === 'target@example.com' && !!mjCode,
+      JSON.stringify(mjReq.body || {}));
+    const mjVerify = await apiMj('/api/me/email/verify', { method: 'POST', token: tokMj, body: { code: mjCode } });
+    check('تأكيد البريد بالرمز المُرسل عبر Mailjet ينجح ويرجع البريد',
+      mjVerify.status === 200 && mjVerify.data.email === 'target@example.com',
+      `status=${mjVerify.status} err=${mjVerify.data.error || ''}`);
+    const mjMe = await apiMj('/api/me', { token: tokMj });
+    check('/api/me بعد تأكيد Mailjet: البريد مضبوط و emailVerified=true',
+      mjMe.data.user?.email === 'target@example.com' && mjMe.data.user?.emailVerified === true,
+      JSON.stringify(mjMe.data.user || {}));
+    // مسار الفشل: الوهمي يردّ 401 — طلب الرمز يفشل 502 ولا يصلح أي رمز
+    mjMode = 'fail';
+    const regMj2 = await apiMj('/api/register', { method: 'POST', body: { username: 'mailjet_fail', password: 'Mailjet123!' } });
+    check('تسجيل mailjet_fail على خادم Mailjet', regMj2.status === 201 && !!regMj2.data.token, `status=${regMj2.status}`);
+    const mjFailSend = await apiMj('/api/me/email', { method: 'POST', token: regMj2.data.token, body: { email: 'fail@example.com' } });
+    check('عند ردّ Mailjet بـ 401: طلب الرمز يرجع 502 «تعذّر إرسال البريد»',
+      mjFailSend.status === 502 && (mjFailSend.data.error || '').includes('تعذّر إرسال'),
+      `status=${mjFailSend.status} err=${mjFailSend.data.error || ''}`);
+    const mjFailVerify = await apiMj('/api/me/email/verify', { method: 'POST', token: regMj2.data.token, body: { code: '123456' } });
+    check('بعد فشل إرسال Mailjet لا يوجد رمز صالح (التأكيد يرجع 400)', mjFailVerify.status === 400, `status=${mjFailVerify.status}`);
+  } finally {
+    server4.kill();
+    mjMock.close();
+    fs.rmSync(dataDir4, { recursive: true, force: true });
   }
 
   B2.close();
