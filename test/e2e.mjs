@@ -10,10 +10,12 @@
 // وملفه لا يُقدَّم إلا بجلسة المالك)، وأمان الحساب: تغيير كلمة المرور (مع
 // إلغاء بقية الجلسات)، وربط بريد مؤكد برمز من ٦ أرقام يُقرأ من صندوق الصادر
 // (MAIL_OUTBOX)، واستعادة كلمة السر بالبريد، وتعطّل نقاط البريد (503) على
-// خادم ثانٍ بلا أي إعداد بريد.
+// خادم ثانٍ بلا أي إعداد بريد، وإرسال Brevo عبر HTTPS API على خادم ثالث
+// يقصده خادم HTTP وهمي محلي (حمولة الطلب كاملة + مسار فشل عند ردّ 400).
 // التشغيل: npm test
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -629,6 +631,96 @@ try {
   } finally {
     server2.kill();
     fs.rmSync(dataDir2, { recursive: true, force: true });
+  }
+
+  // 18) إرسال Brevo عبر HTTPS API: خادم ثالث بـ BREVO_API_KEY وبلا صندوق صادر
+  // وبلا SMTP، يقصد خادم HTTP وهمياً محلياً يحاكي Brevo (يسجّل الطلبات ويردّ
+  // 201، أو 400 في وضع الفشل). دورة ربط البريد كاملة تمرّ عبر هذا المسار.
+  const brevoRequests = [];
+  let brevoMode = 'ok';
+  const brevoMock = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      let reqBody = {};
+      try { reqBody = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); } catch {}
+      brevoRequests.push({ method: req.method, url: req.url, headers: req.headers, body: reqBody });
+      if (brevoMode === 'ok') {
+        res.writeHead(201, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ messageId: '<mock-brevo-id>' }));
+      } else {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ code: 'invalid_parameter', message: 'sender email not verified (mock)' }));
+      }
+    });
+  });
+  await new Promise((r) => brevoMock.listen(0, '127.0.0.1', r));
+  const brevoMockUrl = `http://127.0.0.1:${brevoMock.address().port}/v3/smtp/email`;
+  const dataDir3 = fs.mkdtempSync(path.join(os.tmpdir(), 'msgtest-brevo-'));
+  const server3 = spawn('node', ['server.js'], {
+    cwd: root,
+    env: {
+      ...process.env, PORT: '3221', DATA_DIR: dataDir3,
+      MAIL_OUTBOX: '', SMTP_USER: '', SMTP_PASS: '', ADMIN_USERNAME: '',
+      BREVO_API_KEY: 'test-key-123', MAIL_FROM: 'sender@test.dev', BREVO_API_URL: brevoMockUrl,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  server3.stderr.on('data', (d) => process.stderr.write('[server3] ' + d));
+  try {
+    const apiBrevo = async (p, { method = 'GET', token, body } = {}) => {
+      const res = await fetch('http://localhost:3221' + p, {
+        method,
+        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: res.status, data: await res.json().catch(() => ({})) };
+    };
+    let up3 = false;
+    for (let i = 0; i < 50 && !up3; i++) {
+      try { const r = await fetch('http://localhost:3221/api/health'); up3 = r.ok; } catch { await wait(200); }
+    }
+    check('الخادم الثالث (Brevo) أقلع', up3);
+    const regBr = await apiBrevo('/api/register', { method: 'POST', body: { username: 'brevo_user', password: 'Brev1234!' } });
+    check('تسجيل brevo_user على خادم Brevo', regBr.status === 201 && !!regBr.data.token, `status=${regBr.status}`);
+    const tokBr = regBr.data.token;
+    brevoRequests.length = 0;
+    const brSend = await apiBrevo('/api/me/email', { method: 'POST', token: tokBr, body: { email: 'Target@Example.com' } });
+    check('طلب رمز تأكيد البريد عبر Brevo ينجح (200)', brSend.status === 200 && brSend.data.ok === true,
+      `status=${brSend.status} err=${brSend.data.error || ''}`);
+    check('الوهمي استلم طلب POST واحداً فقط إلى مسار Brevo',
+      brevoRequests.length === 1 && brevoRequests[0].method === 'POST' && brevoRequests[0].url === '/v3/smtp/email',
+      `count=${brevoRequests.length} url=${brevoRequests[0]?.url || ''}`);
+    const brReq = brevoRequests[0] || { headers: {}, body: {} };
+    check('ترويسة api-key في طلب Brevo تساوي المفتاح المضبوط', brReq.headers['api-key'] === 'test-key-123',
+      `api-key=${brReq.headers['api-key'] || ''}`);
+    const brCode = codeFromMail({ text: brReq.body.textContent || '' });
+    check('حمولة Brevo: المُرسِل المضبوط واسمه، والمستقبِل الصحيح، ونص فيه رمز من ٦ أرقام',
+      brReq.body.sender?.email === 'sender@test.dev' && brReq.body.sender?.name === 'رسائلي' &&
+      brReq.body.to?.[0]?.email === 'target@example.com' && !!brCode,
+      JSON.stringify(brReq.body || {}));
+    const brVerify = await apiBrevo('/api/me/email/verify', { method: 'POST', token: tokBr, body: { code: brCode } });
+    check('تأكيد البريد بالرمز المُرسل عبر Brevo ينجح ويرجع البريد',
+      brVerify.status === 200 && brVerify.data.email === 'target@example.com',
+      `status=${brVerify.status} err=${brVerify.data.error || ''}`);
+    const brMe = await apiBrevo('/api/me', { token: tokBr });
+    check('/api/me بعد تأكيد Brevo: البريد مضبوط و emailVerified=true',
+      brMe.data.user?.email === 'target@example.com' && brMe.data.user?.emailVerified === true,
+      JSON.stringify(brMe.data.user || {}));
+    // مسار الفشل: الوهمي يردّ 400 بخطأ JSON — طلب الرمز يفشل 502 ولا يصلح أي رمز
+    brevoMode = 'fail';
+    const regBr2 = await apiBrevo('/api/register', { method: 'POST', body: { username: 'brevo_fail', password: 'Brev1234!' } });
+    check('تسجيل brevo_fail على خادم Brevo', regBr2.status === 201 && !!regBr2.data.token, `status=${regBr2.status}`);
+    const brFailSend = await apiBrevo('/api/me/email', { method: 'POST', token: regBr2.data.token, body: { email: 'fail@example.com' } });
+    check('عند ردّ Brevo بـ 400: طلب الرمز يرجع 502 «تعذّر إرسال البريد»',
+      brFailSend.status === 502 && (brFailSend.data.error || '').includes('تعذّر إرسال'),
+      `status=${brFailSend.status} err=${brFailSend.data.error || ''}`);
+    const brFailVerify = await apiBrevo('/api/me/email/verify', { method: 'POST', token: regBr2.data.token, body: { code: '123456' } });
+    check('بعد فشل إرسال Brevo لا يوجد رمز صالح (التأكيد يرجع 400)', brFailVerify.status === 400, `status=${brFailVerify.status}`);
+  } finally {
+    server3.kill();
+    brevoMock.close();
+    fs.rmSync(dataDir3, { recursive: true, force: true });
   }
 
   B2.close();
