@@ -5,7 +5,12 @@
 // الاسم 1–24 وحساسية حالة الأحرف، والصورة الشخصية، وعرض ملف مستخدم
 // (GET /api/users/:username)، وتغيير اسم المستخدم (الاسم المُخلى متاح فوراً —
 // لا مهلة حجز)، وإعادة التفاوض (عرض/جواب ثانٍ) أثناء مكالمة قائمة، ولوحة
-// بيانات المالك (ADMIN_USERNAME=admin_test في بيئة خادم الاختبار).
+// بيانات المالك (ADMIN_USERNAME=admin_test في بيئة خادم الاختبار)، واحتجاز
+// المحتوى المحذوف لدى الجميع للمالك وحده (يبقى كاملاً في لوحة البيانات،
+// وملفه لا يُقدَّم إلا بجلسة المالك)، وأمان الحساب: تغيير كلمة المرور (مع
+// إلغاء بقية الجلسات)، وربط بريد مؤكد برمز من ٦ أرقام يُقرأ من صندوق الصادر
+// (MAIL_OUTBOX)، واستعادة كلمة السر بالبريد، وتعطّل نقاط البريد (503) على
+// خادم ثانٍ بلا أي إعداد بريد.
 // التشغيل: npm test
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -18,6 +23,7 @@ const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const PORT = 3219;
 const BASE = `http://localhost:${PORT}`;
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'msgtest-'));
+const outboxPath = path.join(dataDir, 'outbox.jsonl');
 
 let passed = 0, failed = 0;
 function check(name, cond, extra = '') {
@@ -72,7 +78,23 @@ function startServer(extraEnv = {}) {
   s.stderr.on('data', (d) => process.stderr.write('[server] ' + d));
   return s;
 }
-let server = startServer({ ADMIN_USERNAME: 'admin_test' });
+let server = startServer({ ADMIN_USERNAME: 'admin_test', MAIL_OUTBOX: outboxPath });
+
+// صندوق الصادر (MAIL_OUTBOX): سطر JSON لكل رسالة — تُستخرج منه رموز التأكيد
+function readOutbox() {
+  try {
+    return fs.readFileSync(outboxPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  } catch { return []; }
+}
+function lastMailTo(email) {
+  const all = readOutbox().filter((m) => m.to === email);
+  return all.length ? all[all.length - 1] : null;
+}
+function codeFromMail(mail) {
+  const m = mail && /(?<!\d)(\d{6})(?!\d)/.exec(mail.text || '');
+  return m ? m[1] : null;
+}
+function wrongCodeFor(code) { return code === '000000' ? '111111' : '000000'; }
 async function waitUp() {
   for (let i = 0; i < 50; i++) {
     try { const r = await fetch(BASE + '/api/health'); if (r.ok) return true; } catch { await wait(200); }
@@ -418,6 +440,196 @@ try {
   const upRow = uploadsAdmin.data.uploads?.find((u) => u.id === upAdminImg.data.fileId);
   check('قائمة ملفات الإدارة تتضمن الصورة بمالكها الصحيح plain_user',
     !!upRow && upRow.owner === 'plain_user' && upRow.mime === 'image/png', JSON.stringify(upRow || {}));
+
+  // 16) الحذف لدى الجميع مع الاحتجاز للمالك: المحتوى يختفي عن الطرفين تماماً
+  // (نص بديل بلا نص وبلا رابط ملف)، لكنه يبقى كاملاً في لوحة البيانات، وملف
+  // الوسائط لا يُقدَّم بعد الحذف إلا بجلسة المالك (ترويسة أو ?t=).
+  const getFileAuth = async (url, token) => {
+    const res = await fetch(BASE + url, { headers: token ? { Authorization: 'Bearer ' + token } : {} });
+    return { status: res.status, buf: Buffer.from(await res.arrayBuffer()) };
+  };
+  const regRetA = await api('/api/register', { method: 'POST', body: { username: 'ret_a', password: 'RetA1234!' } });
+  const regRetB = await api('/api/register', { method: 'POST', body: { username: 'ret_b', password: 'RetB1234!' } });
+  check('تسجيل ret_a و ret_b (اختبار الاحتجاز)', regRetA.status === 201 && regRetB.status === 201,
+    `a=${regRetA.status} b=${regRetB.status}`);
+  const tokRetA = regRetA.data.token, tokRetB = regRetB.data.token;
+  const upRet = await uploadRaw(PNG_BYTES, { token: tokRetA, mime: 'image/png', name: 'retained.png' });
+  check('ret_a يرفع صورة لرسالة الاحتجاز', upRet.status === 201 && !!upRet.data.fileId, `status=${upRet.status}`);
+  const retFileUrl = '/files/' + upRet.data.fileId;
+  const beforeDel = await getFileRaw(retFileUrl);
+  check('قبل الحذف: الملف متاح علناً بمعرّفه (200)', beforeDel.status === 200 && beforeDel.buf.equals(PNG_BYTES), `status=${beforeDel.status}`);
+  const retTextMsg = await api('/api/messages/ret_b', { method: 'POST', token: tokRetA, body: { text: 'نص محذوف يبقى عند المالك فقط' } });
+  const retImgMsg = await api('/api/messages/ret_b', { method: 'POST', token: tokRetA, body: { kind: 'image', fileId: upRet.data.fileId } });
+  check('ret_a يرسل رسالة نصية ورسالة صورة إلى ret_b',
+    retTextMsg.status === 201 && retImgMsg.status === 201 && retImgMsg.data.message?.kind === 'image',
+    `text=${retTextMsg.status} img=${retImgMsg.status}`);
+  const retTextId = retTextMsg.data.message?.id, retImgId = retImgMsg.data.message?.id;
+  const delRetText = await api('/api/messages/' + retTextId, { method: 'DELETE', token: tokRetA, body: { scope: 'everyone' } });
+  const delRetImg = await api('/api/messages/' + retImgId, { method: 'DELETE', token: tokRetA, body: { scope: 'everyone' } });
+  check('ret_a يحذف الرسالتين لدى الجميع (200)', delRetText.status === 200 && delRetImg.status === 200,
+    `text=${delRetText.status} img=${delRetImg.status}`);
+  await wait(200);
+  // (أ) السجل العادي عند الطرفين: نص بديل بلا أي محتوى
+  const histRetB = await api('/api/messages/ret_a', { token: tokRetB });
+  const tombTextB = histRetB.data.messages?.find((m) => m.id === retTextId);
+  const tombImgB = histRetB.data.messages?.find((m) => m.id === retImgId);
+  check('سجل ret_b: الرسالة النصية المحذوفة بلا نص (deleted فقط)',
+    !!tombTextB && tombTextB.deleted === true && !tombTextB.text, JSON.stringify(tombTextB || {}));
+  check('سجل ret_b: رسالة الصورة المحذوفة بلا fileUrl وبلا fileId',
+    !!tombImgB && tombImgB.deleted === true && !tombImgB.fileUrl && !tombImgB.fileId, JSON.stringify(tombImgB || {}));
+  const histRetA = await api('/api/messages/ret_b', { token: tokRetA });
+  const tombImgA = histRetA.data.messages?.find((m) => m.id === retImgId);
+  check('سجل ret_a نفسه: الصورة المحذوفة بلا fileUrl أيضاً',
+    !!tombImgA && tombImgA.deleted === true && !tombImgA.fileUrl, JSON.stringify(tombImgA || {}));
+  // (ب) الملف المُحتجَز: 404 لغير المالك
+  const fileAnon = await getFileRaw(retFileUrl);
+  check('بعد الحذف: GET الملف بدون مصادقة يُرجع 404', fileAnon.status === 404, `status=${fileAnon.status}`);
+  const fileAsB = await getFileAuth(retFileUrl, tokRetB);
+  check('بعد الحذف: GET الملف بجلسة ret_b (غير المالك) يُرجع 404', fileAsB.status === 404, `status=${fileAsB.status}`);
+  // (ج) لوحة البيانات: المحتوى الأصلي كاملاً مع deleted و deletedAt
+  const msgsRetAdmin = await api('/api/admin/messages?a=ret_a&b=ret_b', { token: tokAdmin });
+  const admText = msgsRetAdmin.data.messages?.find((m) => m.id === retTextId);
+  const admImg = msgsRetAdmin.data.messages?.find((m) => m.id === retImgId);
+  check('لوحة البيانات: النص الأصلي محفوظ مع deleted:true و deletedAt',
+    !!admText && admText.text.includes('يبقى عند المالك فقط') && admText.deleted === true && typeof admText.deletedAt === 'number',
+    JSON.stringify(admText || {}));
+  check('لوحة البيانات: رسالة الصورة تحتفظ بـ fileUrl مع deleted:true و deletedAt',
+    !!admImg && admImg.fileUrl === retFileUrl && admImg.deleted === true && typeof admImg.deletedAt === 'number',
+    JSON.stringify(admImg || {}));
+  // (د) المالك وحده يفتح الملف المُحتجَز — بالاستعلام وبالترويسة — بنفس البايتات
+  const fileAdminQ = await getFileRaw(retFileUrl + '?t=' + encodeURIComponent(tokAdmin));
+  check('المالك يفتح الملف المُحتجَز عبر ?t= (200 ونفس البايتات)',
+    fileAdminQ.status === 200 && fileAdminQ.buf.equals(PNG_BYTES), `status=${fileAdminQ.status}`);
+  const fileAdminH = await getFileAuth(retFileUrl, tokAdmin);
+  check('المالك يفتح الملف المُحتجَز عبر ترويسة Authorization (200 ونفس البايتات)',
+    fileAdminH.status === 200 && fileAdminH.buf.equals(PNG_BYTES), `status=${fileAdminH.status}`);
+  // (هـ) قائمة ملفات الإدارة: الملف موجود ومُعلَّم retained — وغير المُحتجَز يبقى علنياً
+  const uploadsAdmin2 = await api('/api/admin/uploads', { token: tokAdmin });
+  const retRow = uploadsAdmin2.data.uploads?.find((u) => u.id === upRet.data.fileId);
+  check('قائمة ملفات الإدارة: الملف المُحتجَز موجود مع retained:true',
+    !!retRow && retRow.retained === true, JSON.stringify(retRow || {}));
+  const plainRow2 = uploadsAdmin2.data.uploads?.find((u) => u.id === upAdminImg.data.fileId);
+  const plainStillPublic = await getFileRaw('/files/' + upAdminImg.data.fileId);
+  check('ملف غير مُحتجَز: retained غير مضبوط ويبقى متاحاً علناً (200)',
+    !!plainRow2 && !plainRow2.retained && plainStillPublic.status === 200,
+    `retained=${plainRow2?.retained} status=${plainStillPublic.status}`);
+
+  // 17) أمان الحساب: تغيير كلمة المرور + ربط بريد مؤكد برمز + استعادة بالبريد
+  const regSec = await api('/api/register', { method: 'POST', body: { username: 'sec_user', password: 'Secu1234!' } });
+  check('تسجيل sec_user (اختبار الأمان)', regSec.status === 201 && !!regSec.data.token, `status=${regSec.status}`);
+  const tokSec1 = regSec.data.token;
+  const loginSec2 = await api('/api/login', { method: 'POST', body: { username: 'sec_user', password: 'Secu1234!' } });
+  const tokSec2 = loginSec2.data.token;
+  check('جلسة ثانية لـ sec_user قبل تغيير كلمة السر', loginSec2.status === 200 && !!tokSec2, `status=${loginSec2.status}`);
+
+  const pwWrongCur = await api('/api/me/password', { method: 'POST', token: tokSec1, body: { currentPassword: 'WrongPass1!', newPassword: 'Newp1234!' } });
+  check('تغيير كلمة السر بكلمة حالية خاطئة يُرفض 401', pwWrongCur.status === 401, `status=${pwWrongCur.status}`);
+  const pwWeak = await api('/api/me/password', { method: 'POST', token: tokSec1, body: { currentPassword: 'Secu1234!', newPassword: 'weak' } });
+  check('تغيير كلمة السر بكلمة جديدة ضعيفة يُرفض 400 مع رسالة القاعدة',
+    pwWeak.status === 400 && (pwWeak.data.error || '').includes('كلمة المرور'), `status=${pwWeak.status}`);
+  const pwChange = await api('/api/me/password', { method: 'POST', token: tokSec1, body: { currentPassword: 'Secu1234!', newPassword: 'Newp1234!' } });
+  check('تغيير كلمة السر ينجح', pwChange.status === 200 && pwChange.data.ok === true, `status=${pwChange.status}`);
+  const loginOldPw = await api('/api/login', { method: 'POST', body: { username: 'sec_user', password: 'Secu1234!' } });
+  check('الدخول بكلمة السر القديمة بعد التغيير يُرفض 401', loginOldPw.status === 401, `status=${loginOldPw.status}`);
+  const loginNewPw = await api('/api/login', { method: 'POST', body: { username: 'sec_user', password: 'Newp1234!' } });
+  check('الدخول بكلمة السر الجديدة يعمل', loginNewPw.status === 200 && !!loginNewPw.data.token, `status=${loginNewPw.status}`);
+  const tokSec3 = loginNewPw.data.token;
+  const meSec2 = await api('/api/me', { token: tokSec2 });
+  check('الجلسة الأخرى أُلغيت بعد تغيير كلمة السر (401)', meSec2.status === 401, `status=${meSec2.status}`);
+  const meSec1 = await api('/api/me', { token: tokSec1 });
+  check('جلسة المُغيِّر نفسها بقيت صالحة بعد التغيير', meSec1.status === 200 && meSec1.data.user?.username === 'sec_user', `status=${meSec1.status}`);
+
+  // ربط البريد: صيغة خاطئة 400 — إرسال رمز — رمز خاطئ 400 — الصحيح يؤكد البريد
+  const emailBad = await api('/api/me/email', { method: 'POST', token: tokSec1, body: { email: 'not-an-email' } });
+  check('بريد بصيغة خاطئة يُرفض 400', emailBad.status === 400, `status=${emailBad.status}`);
+  const emailSend = await api('/api/me/email', { method: 'POST', token: tokSec1, body: { email: 'Sec@Example.com' } });
+  check('طلب رمز تأكيد البريد ينجح', emailSend.status === 200 && emailSend.data.ok === true, `status=${emailSend.status}`);
+  const linkMail = lastMailTo('sec@example.com');
+  const linkCode = codeFromMail(linkMail);
+  check('وصل بريد التأكيد إلى الصادر (بأحرف صغيرة) وفيه رمز من ٦ أرقام', !!linkMail && !!linkCode, JSON.stringify(linkMail || {}));
+  const verifyWrong = await api('/api/me/email/verify', { method: 'POST', token: tokSec1, body: { code: wrongCodeFor(linkCode) } });
+  check('رمز تأكيد خاطئ يُرفض 400 «الرمز غير صحيح»',
+    verifyWrong.status === 400 && (verifyWrong.data.error || '').includes('الرمز غير صحيح'),
+    `status=${verifyWrong.status} err=${verifyWrong.data.error || ''}`);
+  const verifyOk = await api('/api/me/email/verify', { method: 'POST', token: tokSec1, body: { code: linkCode } });
+  check('الرمز الصحيح يؤكد البريد ويرجعه', verifyOk.status === 200 && verifyOk.data.email === 'sec@example.com', `status=${verifyOk.status}`);
+  const meSecMail = await api('/api/me', { token: tokSec1 });
+  check('/api/me يعرض البريد المؤكد و emailVerified=true ولا pendingEmail',
+    meSecMail.data.user?.email === 'sec@example.com' && meSecMail.data.user?.emailVerified === true && !meSecMail.data.user?.pendingEmail,
+    JSON.stringify(meSecMail.data.user || {}));
+
+  // مهلة إعادة الإرسال (٦٠ ثانية): طلب رمز ثانٍ فوراً لنفس الغرض → 429
+  const regCool = await api('/api/register', { method: 'POST', body: { username: 'cool_user', password: 'Cool1234!' } });
+  const cool1 = await api('/api/me/email', { method: 'POST', token: regCool.data.token, body: { email: 'cool@example.com' } });
+  const cool2 = await api('/api/me/email', { method: 'POST', token: regCool.data.token, body: { email: 'cool@example.com' } });
+  check('إعادة طلب رمز خلال ٦٠ ثانية تُرفض 429', cool1.status === 200 && cool2.status === 429, `first=${cool1.status} second=${cool2.status}`);
+
+  // الاستعادة: نسيت → رمز في الصادر → رمز خاطئ 400 → الصحيح يبدّل كلمة السر ويُلغي كل الجلسات
+  const forgotSec = await api('/api/password/forgot', { method: 'POST', body: { username: 'sec_user' } });
+  check('طلب الاستعادة لحساب له بريد مؤكد يرجع 200', forgotSec.status === 200 && forgotSec.data.ok === true, `status=${forgotSec.status}`);
+  const resetMail = lastMailTo('sec@example.com');
+  const resetCode = codeFromMail(resetMail);
+  check('وصل بريد الاستعادة (موضوعه «استعادة») وفيه رمز من ٦ أرقام',
+    !!resetMail && !!resetCode && (resetMail.subject || '').includes('استعادة'), JSON.stringify(resetMail || {}));
+  const resetWrong = await api('/api/password/reset', { method: 'POST', body: { username: 'sec_user', code: wrongCodeFor(resetCode), newPassword: 'Reset123!' } });
+  check('رمز استعادة خاطئ يُرفض 400', resetWrong.status === 400, `status=${resetWrong.status}`);
+  const resetOk = await api('/api/password/reset', { method: 'POST', body: { username: 'sec_user', code: resetCode, newPassword: 'Reset123!' } });
+  check('الرمز الصحيح يعيّن كلمة السر الجديدة', resetOk.status === 200 && resetOk.data.ok === true, `status=${resetOk.status} err=${resetOk.data.error || ''}`);
+  const loginAfterResetOld = await api('/api/login', { method: 'POST', body: { username: 'sec_user', password: 'Newp1234!' } });
+  check('كلمة السر قبل الاستعادة لم تعد تعمل (401)', loginAfterResetOld.status === 401, `status=${loginAfterResetOld.status}`);
+  const loginAfterResetNew = await api('/api/login', { method: 'POST', body: { username: 'sec_user', password: 'Reset123!' } });
+  check('الدخول بكلمة السر المُستعادة يعمل', loginAfterResetNew.status === 200 && !!loginAfterResetNew.data.token, `status=${loginAfterResetNew.status}`);
+  const meSec1After = await api('/api/me', { token: tokSec1 });
+  const meSec3After = await api('/api/me', { token: tokSec3 });
+  check('كل جلسات sec_user السابقة أُلغيت بعد الاستعادة (401)',
+    meSec1After.status === 401 && meSec3After.status === 401, `s1=${meSec1After.status} s3=${meSec3After.status}`);
+
+  // نسيت لحساب بلا بريد مؤكد أو لحساب غير موجود: 200 دائماً وبلا أي بريد صادر
+  const regNoMail = await api('/api/register', { method: 'POST', body: { username: 'noemail_user', password: 'NoMail123!' } });
+  check('تسجيل noemail_user (بلا بريد)', regNoMail.status === 201, `status=${regNoMail.status}`);
+  const outboxCountBefore = readOutbox().length;
+  const forgotNoMail = await api('/api/password/forgot', { method: 'POST', body: { username: 'noemail_user' } });
+  check('طلب الاستعادة لحساب بلا بريد مؤكد يرجع 200', forgotNoMail.status === 200, `status=${forgotNoMail.status}`);
+  const forgotGhost = await api('/api/password/forgot', { method: 'POST', body: { username: 'ghost_xyz' } });
+  check('طلب الاستعادة لحساب غير موجود يرجع 200', forgotGhost.status === 200, `status=${forgotGhost.status}`);
+  check('لم يُرسل أي بريد في حالتي «بلا بريد» و«غير موجود»', readOutbox().length === outboxCountBefore,
+    `before=${outboxCountBefore} after=${readOutbox().length}`);
+  const resetGhost = await api('/api/password/reset', { method: 'POST', body: { username: 'ghost_xyz', code: '123456', newPassword: 'Reset123!' } });
+  check('استعادة لحساب غير موجود تُرفض 400 برسالة موحّدة «الرمز غير صحيح أو منتهٍ»',
+    resetGhost.status === 400 && (resetGhost.data.error || '').includes('الرمز غير صحيح أو منتهٍ'), `status=${resetGhost.status}`);
+
+  // البريد معطّل تماماً: خادم ثانٍ بلا MAIL_OUTBOX وبلا SMTP → النقاط البريدية 503
+  const dataDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'msgtest-nomail-'));
+  const server2 = spawn('node', ['server.js'], {
+    cwd: root,
+    env: { ...process.env, PORT: '3220', DATA_DIR: dataDir2, MAIL_OUTBOX: '', SMTP_USER: '', SMTP_PASS: '', ADMIN_USERNAME: '' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  server2.stderr.on('data', (d) => process.stderr.write('[server2] ' + d));
+  try {
+    let up2 = false;
+    for (let i = 0; i < 50 && !up2; i++) {
+      try { const r = await fetch('http://localhost:3220/api/health'); up2 = r.ok; } catch { await wait(200); }
+    }
+    check('الخادم الثاني (بلا إعداد بريد) أقلع', up2);
+    const apiNoMail = async (p, { method = 'GET', token, body } = {}) => {
+      const res = await fetch('http://localhost:3220' + p, {
+        method,
+        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: res.status, data: await res.json().catch(() => ({})) };
+    };
+    const regNm = await apiNoMail('/api/register', { method: 'POST', body: { username: 'nomail_user', password: 'NoMail123!' } });
+    const emailDisabled = await apiNoMail('/api/me/email', { method: 'POST', token: regNm.data.token, body: { email: 'x@example.com' } });
+    check('بلا إعداد بريد: ربط البريد يرجع 503 «إرسال البريد غير مفعّل بعد»',
+      emailDisabled.status === 503 && (emailDisabled.data.error || '').includes('غير مفعّل'), `status=${emailDisabled.status}`);
+    const forgotDisabled = await apiNoMail('/api/password/forgot', { method: 'POST', body: { username: 'nomail_user' } });
+    check('بلا إعداد بريد: طلب الاستعادة يرجع 503', forgotDisabled.status === 503, `status=${forgotDisabled.status}`);
+  } finally {
+    server2.kill();
+    fs.rmSync(dataDir2, { recursive: true, force: true });
+  }
 
   B2.close();
   A.close();
