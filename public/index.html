@@ -46,7 +46,10 @@
       <span id="my-name"></span>
       <span id="conn-dot" class="dot offline" title="الحالة"></span>
     </button>
-    <button id="logout-btn" type="button" class="ghost">خروج</button>
+    <span class="topbar-actions">
+      <button id="admin-btn" type="button" class="ghost" hidden>🗄 لوحة البيانات</button>
+      <button id="logout-btn" type="button" class="ghost">خروج</button>
+    </span>
   </header>
 
   <nav class="tabs main-tabs">
@@ -95,11 +98,36 @@
   <div id="upload-status" class="upload-status" hidden>جارٍ الرفع…</div>
 </section>
 
+<!-- شاشة لوحة بيانات المالك (تظهر فقط لحساب المالك) -->
+<section id="admin-screen" class="screen" hidden>
+  <header class="topbar">
+    <button id="admin-back" type="button" class="ghost">→ رجوع</button>
+    <div class="chat-title">🗄 لوحة البيانات</div>
+    <span></span>
+  </header>
+  <div class="view admin-view">
+    <p id="admin-overview" class="admin-overview">جارٍ التحميل…</p>
+    <h3>المستخدمون</h3>
+    <ul id="admin-users" class="list"></ul>
+    <h3>المحادثات</h3>
+    <ul id="admin-conversations" class="list"></ul>
+    <div id="admin-thread" hidden>
+      <div class="admin-thread-head">
+        <strong id="admin-thread-title"></strong>
+        <button id="admin-thread-close" type="button" class="ghost">إغلاق</button>
+      </div>
+      <div id="admin-messages" class="messages admin-messages"></div>
+    </div>
+    <h3>الملفات المرفوعة</h3>
+    <div id="admin-uploads" class="admin-uploads"></div>
+  </div>
+</section>
+
 <!-- لوحة الملف الشخصي: الصورة الشخصية + تغيير اسم المستخدم -->
 <div id="profile-panel" class="profile-panel" hidden>
   <div class="profile-card">
     <button id="profile-close" type="button" class="ghost profile-x" title="إغلاق">✕</button>
-    <div id="profile-avatar" class="avatar avatar-lg"></div>
+    <div id="profile-avatar" class="avatar avatar-lg tappable" title="عرض الصورة بحجم كامل"></div>
     <div id="profile-name" class="profile-name"></div>
     <button id="avatar-change-btn" type="button" class="ghost">تغيير الصورة الشخصية</button>
     <input id="avatar-input" type="file" accept="image/*" hidden>
@@ -108,12 +136,35 @@
       <label for="new-username" class="profile-label">تغيير اسم المستخدم</label>
       <input id="new-username" type="text" placeholder="اسم المستخدم الجديد" autocomplete="off">
       <p class="hint">من حرف واحد حتى ٢٤ حرفاً، يبدأ بحرف أو رقم</p>
-      <p class="hint warn">تنبيه: اسمك القديم يبقى محجوزاً لك ٣ أيام (يمكنك الرجوع إليه)، وبعدها يستطيع أي شخص أخذه</p>
+      <p class="hint warn">تنبيه: سيصبح اسمك القديم متاحاً فوراً لأي شخص آخر</p>
       <button type="submit">حفظ الاسم الجديد</button>
       <p id="profile-error" class="error" hidden></p>
       <p id="profile-ok" class="ok" hidden></p>
     </form>
+    <hr class="profile-sep">
+    <p class="hint privacy-note">حماية الخصوصية: نمنع حفظ الصور من داخل التطبيق ونخفي المحتوى عند تبديل التطبيقات. ملاحظة: لا يمكن لأي موقع ويب منع لقطات شاشة نظام التشغيل منعاً كاملاً — الحظر الكامل يحتاج نسخة التطبيق الأصلية (أندرويد/آيفون)</p>
   </div>
+</div>
+
+<!-- لوحة عرض ملف مستخدم آخر: صورة كبيرة + حالة + مراسلة/اتصال -->
+<div id="user-profile-panel" class="profile-panel" hidden>
+  <div class="profile-card">
+    <button id="user-profile-close" type="button" class="ghost profile-x" title="إغلاق">✕</button>
+    <div id="user-profile-avatar" class="avatar avatar-lg tappable" title="عرض الصورة بحجم كامل"></div>
+    <div id="user-profile-name" class="profile-name"></div>
+    <div id="user-profile-status" class="profile-status"></div>
+    <div class="profile-actions">
+      <button id="user-profile-msg" type="button">مراسلة</button>
+      <button id="user-profile-voice" type="button" class="ghost">📞 صوت</button>
+      <button id="user-profile-video" type="button" class="ghost">📹 فيديو</button>
+    </div>
+  </div>
+</div>
+
+<!-- عارض الصور بملء الشاشة داخل التطبيق -->
+<div id="image-viewer" hidden>
+  <button id="image-viewer-close" type="button" class="viewer-x" title="إغلاق">✕</button>
+  <img id="image-viewer-img" alt="" draggable="false">
 </div>
 
 <!-- قائمة حذف الرسالة (ضغط مطوّل أو نقر يمين على الفقاعة) -->

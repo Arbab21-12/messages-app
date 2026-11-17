@@ -123,6 +123,11 @@ button.ghost { background:transparent; color:var(--brand); border:1px solid var(
 .call-toast { position:absolute; left:50%; transform:translateX(-50%); bottom:118px; z-index:5; background:rgba(0,0,0,.75); color:#fff; padding:9px 16px; border-radius:999px; font-size:14px; max-width:88%; text-align:center; }
 
 /* لوحة الملف الشخصي */
+.topbar-actions { display:flex; gap:8px; align-items:center; }
+.tappable { cursor:pointer; }
+.profile-status { color:var(--muted); font-size:14px; }
+.profile-actions { display:flex; gap:8px; }
+.profile-actions button { flex:1; }
 .profile-panel { position:fixed; inset:0; z-index:80; background:rgba(10,20,16,.45); display:flex; align-items:flex-start; justify-content:center; padding:24px 14px; overflow-y:auto; }
 .profile-card { background:#fff; border-radius:16px; padding:22px 20px; width:100%; max-width:380px; position:relative; display:flex; flex-direction:column; gap:10px; text-align:center; box-shadow:0 18px 50px rgba(0,0,0,.25); }
 .profile-card .avatar-lg { margin:2px auto 0; }
@@ -134,3 +139,35 @@ button.ghost { background:transparent; color:var(--brand); border:1px solid var(
 #username-form .hint { margin:0; }
 .hint.warn { color:#a15c00; }
 .ok { color:#1e7d46; margin:4px 0 0; }
+.privacy-note { text-align:start; line-height:1.7; }
+
+/* عارض الصور بملء الشاشة داخل التطبيق */
+#image-viewer { position:fixed; inset:0; z-index:120; background:rgba(0,0,0,.93); display:flex; align-items:center; justify-content:center; }
+#image-viewer img { max-width:100%; max-height:100%; object-fit:contain; }
+.viewer-x { position:absolute; top:calc(12px + env(safe-area-inset-top)); inset-inline-start:12px; z-index:2; background:rgba(255,255,255,.15); color:#fff; border:1px solid rgba(255,255,255,.4); padding:8px 13px; }
+.viewer-x:hover { background:rgba(255,255,255,.3); }
+
+/* حماية الخصوصية على الوسائط والصور الشخصية: منع اللمس المطوّل/التحديد/السحب */
+.bubble.media, .avatar, .call-avatar, #image-viewer, #user-profile-panel .profile-card, #admin-screen .admin-upload {
+  -webkit-touch-callout:none; -webkit-user-select:none; user-select:none;
+}
+.bubble.media img, .bubble.media video, .avatar img, .call-avatar img, #image-viewer img { -webkit-user-drag:none; }
+
+/* إخفاء المحتوى عند تبديل التطبيقات: تعتيم كامل للواجهة ما دامت الصفحة مخفية */
+body.app-hidden .screen,
+body.app-hidden .call-overlay,
+body.app-hidden .profile-panel,
+body.app-hidden .msg-menu,
+body.app-hidden #image-viewer { filter:blur(18px); }
+
+/* لوحة بيانات المالك */
+.admin-view h3 { margin:20px 0 2px; }
+.admin-overview { background:#eef7f2; border:1px solid var(--border); border-radius:12px; padding:10px 12px; margin:6px 0 0; }
+.admin-thread-head { display:flex; align-items:center; justify-content:space-between; margin-top:16px; }
+.admin-messages { border:1px solid var(--border); border-radius:12px; margin-top:8px; max-height:52vh; }
+.admin-uploads { display:grid; grid-template-columns:repeat(auto-fill,minmax(104px,1fr)); gap:10px; margin-top:10px; }
+.admin-upload { border:1px solid var(--border); border-radius:12px; padding:6px; text-align:center; font-size:12px; color:var(--muted); word-break:break-word; }
+.admin-upload img { width:100%; height:84px; object-fit:cover; border-radius:8px; display:block; cursor:pointer; margin-bottom:4px; }
+.admin-upload a { color:var(--brand); font-weight:700; text-decoration:none; display:flex; flex-direction:column; align-items:center; gap:2px; padding:16px 0; font-size:24px; }
+.admin-upload a span { font-size:13px; }
+.admin-deleted-tag { background:#c0392b; color:#fff; font-size:11px; border-radius:6px; padding:1px 6px; font-style:normal; }

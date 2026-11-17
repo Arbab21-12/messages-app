@@ -20,7 +20,7 @@ const api = async (path, opts = {}) => {
 };
 
 function show(id) {
-  for (const s of ['auth-screen', 'main-screen', 'chat-screen']) $(s).hidden = s !== id;
+  for (const s of ['auth-screen', 'main-screen', 'chat-screen', 'admin-screen']) $(s).hidden = s !== id;
 }
 function fmtTime(ts) {
   return new Date(ts).toLocaleTimeString('ar', { hour: '2-digit', minute: '2-digit' });
@@ -49,6 +49,7 @@ function setAvatarEl(el, username, avatar) {
     const img = document.createElement('img');
     img.src = url;
     img.alt = '';
+    img.draggable = false; // حماية الخصوصية: منع سحب الصورة وحفظها
     el.appendChild(img);
   } else {
     el.textContent = (username && username[0]) || '؟';
@@ -56,9 +57,99 @@ function setAvatarEl(el, username, avatar) {
 }
 function avatarHtml(username, avatar, cls = 'avatar') {
   const url = avatar || avatarFor(username);
-  const inner = url ? `<img src="${url}" alt="">` : escapeHtml((username && username[0]) || '؟');
+  const inner = url ? `<img src="${url}" alt="" draggable="false">` : escapeHtml((username && username[0]) || '؟');
   return `<div class="${cls}">${inner}</div>`;
 }
+
+// ---------- عرض ملف مستخدم + عارض الصور + حماية الخصوصية ----------
+// الضغط على الصورة أو الاسم في أي قائمة/ترويسة يفتح لوحة ملف ذلك المستخدم،
+// وبقية الصفّ يفتح المحادثة كالمعتاد.
+function wireProfileTap(li, username) {
+  const av = li.querySelector('.avatar');
+  const nameEl = li.querySelector('.row-title span');
+  if (av) av.addEventListener('click', (e) => { e.stopPropagation(); openUserProfile(username); });
+  if (nameEl) nameEl.addEventListener('click', (e) => { e.stopPropagation(); openUserProfile(username); });
+}
+
+let viewedUser = null; // { username, avatar } — المستخدم المعروض في لوحة الملف
+async function openUserProfile(username) {
+  if (!me || !username) return;
+  if (username === me.username) { openProfile(); return; } // ملفي أنا → لوحة التحرير
+  viewedUser = { username, avatar: avatarFor(username) };
+  $('user-profile-name').textContent = username;
+  setAvatarEl($('user-profile-avatar'), username, viewedUser.avatar);
+  $('user-profile-status').textContent = onlineUsers.has(username) ? 'متصل الآن' : 'غير متصل';
+  $('user-profile-panel').hidden = false;
+  try {
+    const data = await api('/api/users/' + encodeURIComponent(username));
+    if (!viewedUser || viewedUser.username !== username) return; // أُغلقت/تغيّرت أثناء الجلب
+    viewedUser = { username: data.username, avatar: data.avatar || null };
+    noteAvatar(data.username, data.avatar);
+    setAvatarEl($('user-profile-avatar'), data.username, data.avatar);
+    $('user-profile-status').textContent = data.online ? 'متصل الآن' : 'غير متصل';
+  } catch {}
+}
+function closeUserProfile() {
+  $('user-profile-panel').hidden = true;
+  viewedUser = null;
+}
+$('user-profile-close').onclick = closeUserProfile;
+$('user-profile-panel').addEventListener('click', (e) => { if (e.target === $('user-profile-panel')) closeUserProfile(); });
+$('user-profile-avatar').addEventListener('click', () => { if (viewedUser && viewedUser.avatar) openImageViewer(viewedUser.avatar); });
+$('user-profile-msg').onclick = () => {
+  const u = viewedUser;
+  closeUserProfile();
+  if (u) openChat(u.username, u.avatar);
+};
+$('user-profile-voice').onclick = async () => {
+  const u = viewedUser;
+  closeUserProfile();
+  if (!u) return;
+  await openChat(u.username, u.avatar);
+  startCall('voice');
+};
+$('user-profile-video').onclick = async () => {
+  const u = viewedUser;
+  closeUserProfile();
+  if (!u) return;
+  await openChat(u.username, u.avatar);
+  startCall('video');
+};
+// ترويسة المحادثة: الضغط على صورة الطرف الآخر أو اسمه يفتح ملفه
+$('chat-avatar').addEventListener('click', () => { if (currentChat) openUserProfile(currentChat); });
+$('chat-name').addEventListener('click', () => { if (currentChat) openUserProfile(currentChat); });
+// صورتي في لوحتي: الضغط عليها يعرضها بحجم كامل داخل التطبيق
+$('profile-avatar').addEventListener('click', () => { if (me && me.avatar) openImageViewer(me.avatar); });
+
+// عارض صور بملء الشاشة داخل التطبيق نفسه (لا تبويب جديد — فتبقى حماية الخصوصية سارية)
+function openImageViewer(url) {
+  if (!url) return;
+  $('image-viewer-img').src = url;
+  $('image-viewer').hidden = false;
+}
+function closeImageViewer() {
+  $('image-viewer').hidden = true;
+  $('image-viewer-img').src = '';
+}
+$('image-viewer-close').onclick = closeImageViewer;
+$('image-viewer').addEventListener('click', (e) => { if (e.target === $('image-viewer')) closeImageViewer(); });
+
+// حماية الخصوصية (مستوى الويب): منع قائمة السياق والسحب على الوسائط والصور الشخصية
+document.addEventListener('contextmenu', (e) => {
+  if (e.target && e.target.closest && e.target.closest('img, video, .bubble.media, .avatar, #image-viewer')) e.preventDefault();
+});
+document.addEventListener('dragstart', (e) => {
+  if (e.target && e.target.tagName === 'IMG') e.preventDefault();
+});
+// عند تبديل التطبيقات/إخفاء الصفحة: تعتيم كامل للواجهة حتى لا تلتقط لقطةُ مُبدّل
+// التطبيقات أو تصويرٌ عابر للمحتوى وهو في الخلفية أيَّ شيء مقروء.
+document.addEventListener('visibilitychange', () => {
+  document.body.classList.toggle('app-hidden', document.hidden);
+  // تحديث حالة الاتصال في لوحة الملف المفتوحة عند العودة
+  if (!document.hidden && viewedUser && !$('user-profile-panel').hidden) {
+    $('user-profile-status').textContent = onlineUsers.has(viewedUser.username) ? 'متصل الآن' : 'غير متصل';
+  }
+});
 
 // ---------- الدخول ----------
 // قواعد الحساب الجديد — مرآة لقواعد الخادم (التحقق النهائي دائماً عند الخادم)
@@ -142,6 +233,7 @@ async function enterApp() {
   $('my-name').textContent = me.username;
   noteAvatar(me.username, me.avatar);
   setAvatarEl($('my-avatar'), me.username, me.avatar);
+  syncAdminBtn();
   show('main-screen');
   connectWs();
   await loadConversations();
@@ -157,6 +249,9 @@ function connectWs() {
     if (data.type === 'presence') {
       onlineUsers = new Set(data.online);
       updatePresenceUI();
+      if (viewedUser && !$('user-profile-panel').hidden) {
+        $('user-profile-status').textContent = onlineUsers.has(viewedUser.username) ? 'متصل الآن' : 'غير متصل';
+      }
       loadPeople($('people-search').value.trim());
     }
     if (data.type === 'message') {
@@ -223,6 +318,7 @@ async function loadConversations() {
       </div>
       ${c.unread ? `<span class="badge">${c.unread}</span>` : ''}`;
     li.onclick = () => openChat(c.username, c.avatar);
+    wireProfileTap(li, c.username);
     list.appendChild(li);
   }
 }
@@ -245,6 +341,7 @@ async function loadPeople(q = '') {
         <div class="row-sub">${on ? 'متصل الآن' : 'غير متصل'}</div>
       </div>`;
     li.onclick = () => openChat(u.username, u.avatar);
+    wireProfileTap(li, u.username);
     list.appendChild(li);
   }
 }
@@ -731,11 +828,9 @@ function showCallOverlay(mode) {
   $('call-outgoing-actions').hidden = mode !== 'outgoing';
   $('call-controls').hidden = mode !== 'active';
   $('call-error').hidden = true;
-  $('call-camera').style.display = isVideo ? '' : 'none';
   $('call-mute').classList.remove('off');
   $('call-mute').textContent = '🎤 كتم';
-  $('call-camera').classList.remove('off');
-  $('call-camera').textContent = '📷 الكاميرا';
+  updateCameraBtn();
   updateSpeakerBtn();
   if (mode === 'outgoing') $('call-status').textContent = 'جارٍ الاتصال…';
   else if (mode === 'incoming') $('call-status').textContent = isVideo ? 'مكالمة فيديو واردة' : 'مكالمة صوتية واردة';
@@ -789,36 +884,78 @@ const VIDEO_CONSTRAINTS = {
   frameRate: { ideal: 30, max: 30 },
   facingMode: 'user',
 };
+/** رفع جودة إرسال مسار فيديو واحد: تلميح «تفاصيل» + حد بت أعلى بدون تصغير للدقة. */
+function tuneVideoSender(sender) {
+  if (!sender || !sender.track || sender.track.kind !== 'video') return;
+  try { sender.track.contentHint = 'detail'; } catch {}
+  try {
+    const params = sender.getParameters() || {};
+    const existing = (params.encodings && params.encodings[0]) || {};
+    params.encodings = [{ ...existing, maxBitrate: 2500000, maxFramerate: 30, scaleResolutionDownBy: 1 }];
+    const p = sender.setParameters(params);
+    if (p && p.catch) p.catch(() => {});
+  } catch {}
+}
+/** حالة زر الكاميرا: «فتح الكاميرا» قبل وجود مسار فيديو محلي، ثم مفتاح تشغيل/إيقاف. */
+function updateCameraBtn() {
+  if (!call) return;
+  const btn = $('call-camera');
+  btn.style.display = ''; // ظاهر دائماً أثناء المكالمة — حتى الصوتية (للترقية لفيديو)
+  const tracks = call.localStream ? call.localStream.getVideoTracks() : [];
+  if (tracks.length) {
+    btn.classList.toggle('off', !tracks[0].enabled);
+    btn.textContent = tracks[0].enabled ? '📷 الكاميرا' : '🚫 الكاميرا';
+  } else {
+    btn.classList.remove('off');
+    btn.textContent = '📷 فتح الكاميرا';
+  }
+}
+/** التحويل لوضع الفيديو في الواجهة (بدء مكالمة فيديو، أو ترقية أثناء المكالمة). */
+function switchToVideoMode() {
+  if (!call) return;
+  call.type = 'video';
+  $('call-avatar').hidden = true;
+  $('remote-video').hidden = false;
+  $('local-video').hidden = false;
+  if (call.localStream) $('local-video').srcObject = call.localStream;
+  // بثّ الطرف الآخر (فيه صوته، والفيديو عند وصوله) ينتقل إلى عنصر الفيديو —
+  // من عنصر الصوت المخصص إن كان هو من يشغّله حالياً (جهة من بدأ الترقية)
+  const remoteStream = $('remote-video').srcObject || $('remote-audio').srcObject;
+  if (remoteStream) $('remote-video').srcObject = remoteStream;
+  $('remote-audio').srcObject = null;
+  updateCameraBtn();
+  applyAudioOutput(false);
+}
+/** بدء تفاوض من جهتنا: إنشاء عرض وإرساله (البدء الأول بعد القبول، أو إعادة تفاوض). */
+async function negotiate() {
+  if (!call || !call.pc) return;
+  try {
+    call.makingOffer = true;
+    const offer = await call.pc.createOffer();
+    await call.pc.setLocalDescription(offer);
+    if (call && call.pc) callSend({ type: 'call_offer', to: call.peer, sdp: call.pc.localDescription });
+  } catch {} finally { if (call) call.makingOffer = false; }
+}
 function setupPeerConnection() {
   const pc = new RTCPeerConnection(ICE_CONFIG);
   call.pc = pc;
   for (const track of call.localStream.getTracks()) pc.addTrack(track, call.localStream);
-  // رفع جودة الإرسال: تلميح «تفاصيل» لمسار الفيديو + حد بت أعلى بدون تصغير للدقة
-  const localVideoTrack = call.localStream.getVideoTracks()[0];
-  if (localVideoTrack) { try { localVideoTrack.contentHint = 'detail'; } catch {} }
-  if (call.type === 'video') {
-    for (const sender of pc.getSenders()) {
-      if (sender.track && sender.track.kind === 'video') {
-        try {
-          const params = sender.getParameters() || {};
-          const existing = (params.encodings && params.encodings[0]) || {};
-          params.encodings = [{ ...existing, maxBitrate: 2500000, maxFramerate: 30, scaleResolutionDownBy: 1 }];
-          const p = sender.setParameters(params);
-          if (p && p.catch) p.catch(() => {});
-        } catch {}
-      }
-    }
-  }
+  // رفع جودة الإرسال لأي مسار فيديو محلي (تلميح تفاصيل + حد بت أعلى)
+  for (const sender of pc.getSenders()) tuneVideoSender(sender);
   if (call.type === 'video') $('local-video').srcObject = call.localStream;
   pc.onicecandidate = (e) => {
     if (e.candidate && call) callSend({ type: 'call_ice', to: call.peer, candidate: e.candidate.toJSON() });
   };
   pc.ontrack = (e) => {
+    if (!call) return;
     const stream = e.streams[0];
-    if (call && call.type === 'video') {
+    if (e.track && e.track.kind === 'video') {
+      // وصل مسار فيديو من الطرف الآخر (مكالمة فيديو، أو ترقية أثناء مكالمة صوتية)
+      $('remote-video').srcObject = stream;
+      switchToVideoMode();
+    } else if (call.type === 'video') {
       // فيديو: الصوت والصورة عبر عنصر الفيديو
       $('remote-video').srcObject = stream;
-      $('remote-video').hidden = false;
     } else {
       // صوت فقط: عبر عنصر صوت مخصص ليتمكن setSinkId من تبديل مخرج الصوت
       $('remote-audio').srcObject = stream;
@@ -856,7 +993,7 @@ async function startCall(type) {
   call = {
     peer, type, role: 'caller', status: 'outgoing',
     pc: null, localStream: stream, connectedAt: null, acceptedAt: null,
-    timer: null, ringTimeout: null, pendingIce: [],
+    timer: null, ringTimeout: null, pendingIce: [], makingOffer: false,
     speaker: type === 'video', // الفيديو: مكبر صوت افتراضياً — الصوتية: سماعة الهاتف
     avatar: avatarFor(peer),
   };
@@ -883,7 +1020,7 @@ function handleCallEvent(data) {
         peer: data.from, type: data.callType === 'video' ? 'video' : 'voice',
         role: 'callee', status: 'incoming',
         pc: null, localStream: null, connectedAt: null, acceptedAt: null,
-        timer: null, ringTimeout: null, pendingIce: [],
+        timer: null, ringTimeout: null, pendingIce: [], makingOffer: false,
         speaker: data.callType === 'video',
         avatar: data.avatar || avatarFor(data.from),
       };
@@ -901,24 +1038,30 @@ function handleCallEvent(data) {
       call.status = 'active';
       call.acceptedAt = Date.now();
       showCallOverlay('active');
-      (async () => {
-        try {
-          const offer = await call.pc.createOffer();
-          await call.pc.setLocalDescription(offer);
-          callSend({ type: 'call_offer', to: call.peer, sdp: call.pc.localDescription });
-        } catch {}
-      })();
+      negotiate();
       break;
     }
     case 'call_offer': {
-      if (!call || call.role !== 'callee' || !call.pc) return;
+      // عرض وارد: إما العرض الأول (نحن الطرف المتلقّي)، أو إعادة تفاوض أثناء مكالمة
+      // جارية (ترقية لفيديو مثلاً) — يُعالج بالطريقة نفسها في الحالتين.
+      if (!call || !call.pc) return;
       (async () => {
         try {
-          await call.pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+          const pc = call.pc;
+          const offerCollision = call.makingOffer || pc.signalingState !== 'stable';
+          if (offerCollision) {
+            // تصادم عرضين (تفاوض متزامن من الطرفين): صاحب اسم المستخدم الأكبر
+            // معجمياً هو «المؤدّب» — يتراجع عن عرضه ويجيب؛ والآخر يتجاهل العرض
+            // المتصادم وينتظر الجواب على عرضه هو.
+            const polite = me.username > call.peer;
+            if (!polite) return;
+            try { await pc.setLocalDescription({ type: 'rollback' }); } catch {}
+          }
+          await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
           flushPendingIce();
-          const answer = await call.pc.createAnswer();
-          await call.pc.setLocalDescription(answer);
-          callSend({ type: 'call_answer', to: call.peer, sdp: call.pc.localDescription });
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          callSend({ type: 'call_answer', to: call.peer, sdp: pc.localDescription });
         } catch {}
       })();
       break;
@@ -995,14 +1138,39 @@ $('call-mute').onclick = () => {
   $('call-mute').classList.toggle('off', !enabled);
   $('call-mute').textContent = enabled ? '🎤 كتم' : '🔇 مكتوم';
 };
-$('call-camera').onclick = () => {
+$('call-camera').onclick = async () => {
   if (!call || !call.localStream) return;
   const tracks = call.localStream.getVideoTracks();
-  if (!tracks.length) return;
-  const enabled = !tracks[0].enabled;
-  tracks.forEach((t) => { t.enabled = enabled; });
-  $('call-camera').classList.toggle('off', !enabled);
-  $('call-camera').textContent = enabled ? '📷 الكاميرا' : '🚫 الكاميرا';
+  if (tracks.length) {
+    // مسار فيديو موجود أصلاً: تشغيل/إيقاف فقط (بدون إعادة تفاوض)
+    const enabled = !tracks[0].enabled;
+    tracks.forEach((t) => { t.enabled = enabled; });
+    updateCameraBtn();
+    return;
+  }
+  // لا فيديو محلي بعد (مكالمة صوتية): فتح الكاميرا وترقية المكالمة إلى فيديو
+  let videoStream;
+  try {
+    videoStream = await navigator.mediaDevices.getUserMedia({ video: VIDEO_CONSTRAINTS });
+  } catch {
+    $('call-error').textContent = 'تعذّر الوصول إلى الكاميرا — المكالمة الصوتية مستمرة. تحقّق من أذونات المتصفح.';
+    $('call-error').hidden = false;
+    setTimeout(() => { $('call-error').hidden = true; }, 3500);
+    return;
+  }
+  if (!call || !call.pc) { // انتهت المكالمة أثناء طلب الإذن
+    videoStream.getTracks().forEach((t) => t.stop());
+    return;
+  }
+  const vTrack = videoStream.getVideoTracks()[0];
+  if (!vTrack) { videoStream.getTracks().forEach((t) => t.stop()); return; }
+  // دمج مسار الفيديو في البث المحلي القائم (يبقى مسار الصوت كما هو، فيعمل
+  // الكتم والإنهاء كما قبل) وإضافته إلى الاتصال القائم مع نفس ضبط الجودة
+  call.localStream.addTrack(vTrack);
+  const sender = call.pc.addTrack(vTrack, call.localStream);
+  tuneVideoSender(sender);
+  switchToVideoMode();
+  negotiate(); // إعادة تفاوض: عرض جديد يحمل مسار الفيديو
 };
 
 // ----- مخرج الصوت: سماعة الهاتف / مكبر الصوت (setSinkId حيثما يدعمه المتصفح) -----
@@ -1067,6 +1235,7 @@ function refreshMyIdentity() {
   // بعد تغيير الصورة أو الاسم: حدّث الترويسة واللوحة والقوائم دون إعادة دخول
   $('my-name').textContent = me.username;
   setAvatarEl($('my-avatar'), me.username, me.avatar);
+  syncAdminBtn();
   $('profile-name').textContent = me.username;
   setAvatarEl($('profile-avatar'), me.username, me.avatar);
   loadConversations();
@@ -1119,6 +1288,130 @@ $('username-form').addEventListener('submit', async (e) => {
     $('profile-error').hidden = false;
   }
 });
+
+// ---------- لوحة بيانات المالك (Admin) — تظهر فقط عندما يكون حسابي هو المالك ----------
+function syncAdminBtn() {
+  $('admin-btn').hidden = !(me && me.isAdmin);
+}
+function fmtBytes(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + ' بايت';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+  return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
+$('admin-btn').onclick = openAdmin;
+$('admin-back').onclick = () => show('main-screen');
+$('admin-thread-close').onclick = () => { $('admin-thread').hidden = true; };
+
+async function openAdmin() {
+  if (!me || !me.isAdmin) return;
+  show('admin-screen');
+  $('admin-thread').hidden = true;
+  try {
+    const [ov, us, cv, up] = await Promise.all([
+      api('/api/admin/overview'),
+      api('/api/admin/users'),
+      api('/api/admin/conversations'),
+      api('/api/admin/uploads'),
+    ]);
+    $('admin-overview').textContent =
+      `المستخدمون: ${ov.users} · الرسائل: ${ov.messages} · الملفات المرفوعة: ${ov.uploads} · الحجم الكلي: ${fmtBytes(ov.uploadBytes)}`;
+    // المستخدمون
+    const ulist = $('admin-users');
+    ulist.innerHTML = '';
+    for (const u of us.users || []) {
+      const li = document.createElement('li');
+      li.innerHTML = `
+        ${avatarHtml(u.username, u.avatar)}
+        <div class="row-main">
+          <div class="row-title"><span>${escapeHtml(u.username)}</span></div>
+          <div class="row-sub">${u.online ? 'متصل الآن' : 'غير متصل'}</div>
+        </div>`;
+      li.onclick = () => openUserProfile(u.username);
+      ulist.appendChild(li);
+    }
+    // المحادثات
+    const clist = $('admin-conversations');
+    clist.innerHTML = '';
+    for (const c of cv.conversations || []) {
+      const li = document.createElement('li');
+      li.innerHTML = `
+        <div class="row-main">
+          <div class="row-title"><span>${escapeHtml(c.a)} ↔ ${escapeHtml(c.b)}</span><time>${c.lastAt ? fmtTime(c.lastAt) : ''}</time></div>
+          <div class="row-sub">${c.count} رسالة · ${escapeHtml(c.lastText || '')}</div>
+        </div>`;
+      li.onclick = () => openAdminThread(c.a, c.b);
+      clist.appendChild(li);
+    }
+    // الملفات المرفوعة
+    const grid = $('admin-uploads');
+    grid.innerHTML = '';
+    for (const u of up.uploads || []) {
+      grid.appendChild(adminUploadItem(u));
+    }
+    if (!(up.uploads || []).length) grid.innerHTML = '<p class="empty">لا ملفات مرفوعة بعد</p>';
+  } catch (err) {
+    alert(err.message || 'فشل تحميل لوحة البيانات');
+    show('main-screen');
+  }
+}
+function adminUploadItem(u) {
+  const item = document.createElement('div');
+  item.className = 'admin-upload';
+  const cap = `<div>${escapeHtml(u.owner || '؟')} · ${fmtBytes(u.size)}</div>`;
+  if ((u.mime || '').startsWith('image/')) {
+    item.innerHTML = `<img src="${u.url}" alt="" draggable="false" loading="lazy">${cap}`;
+    item.querySelector('img').onclick = () => openImageViewer(u.url);
+  } else {
+    const icon = (u.mime || '').startsWith('video/') ? '🎥' : (u.mime || '').startsWith('audio/') ? '🎤' : '📄';
+    const label = (u.mime || '').startsWith('video/') ? 'فيديو' : (u.mime || '').startsWith('audio/') ? 'صوت' : 'ملف';
+    item.innerHTML = `<a href="${u.url}" target="_blank" rel="noopener">${icon}<span>${label}</span></a>${cap}`;
+  }
+  return item;
+}
+async function openAdminThread(a, b) {
+  try {
+    const data = await api('/api/admin/messages?a=' + encodeURIComponent(a) + '&b=' + encodeURIComponent(b));
+    $('admin-thread-title').textContent = `محادثة ${data.a} ↔ ${data.b}`;
+    const box = $('admin-messages');
+    box.innerHTML = '';
+    for (const m of data.messages || []) box.appendChild(renderAdminMessage(m, data.a));
+    $('admin-thread').hidden = false;
+    box.scrollTop = box.scrollHeight;
+    $('admin-thread').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } catch (err) { alert(err.message || 'فشل تحميل المحادثة'); }
+}
+/** عرض رسالة في لوحة المالك (للقراءة فقط) — بنفس أشكال المحادثة، مع وسم «محذوفة». */
+function renderAdminMessage(m, userA) {
+  if (m.kind === 'call' && !m.deleted) {
+    const div = document.createElement('div');
+    div.className = 'call-record';
+    div.textContent = `${m.text} · ${fmtTime(m.ts)}`;
+    return div;
+  }
+  const div = document.createElement('div');
+  div.className = 'bubble ' + (m.from === userA ? 'mine' : 'theirs');
+  const meta = `<span class="meta">${escapeHtml(m.from || '')} · ${fmtTime(m.ts)}</span>`;
+  if (m.deleted) {
+    div.classList.add('deleted');
+    div.innerHTML = `<span class="deleted-text">🚫 تم حذف هذه الرسالة</span> <span class="admin-deleted-tag">محذوفة</span>${meta}`;
+  } else if (m.kind === 'image') {
+    div.classList.add('media');
+    div.innerHTML = `<img class="msg-img" src="${m.fileUrl}" alt="صورة" loading="lazy" draggable="false">${meta}`;
+    div.querySelector('img').onclick = () => openImageViewer(m.fileUrl);
+  } else if (m.kind === 'video') {
+    div.classList.add('media');
+    div.innerHTML = `<video class="msg-video" src="${m.fileUrl}" controls preload="metadata" playsinline></video>${meta}`;
+  } else if (m.kind === 'voice') {
+    div.classList.add('media');
+    div.innerHTML = `<div class="voice-player"><button type="button" class="voice-play" title="تشغيل">▶</button><span class="voice-dur">${fmtCallDuration(m.durationSec || 0)}</span><audio src="${m.fileUrl}" preload="metadata"></audio></div>${meta}`;
+    wireVoicePlayer(div, m);
+  } else {
+    div.innerHTML = `${escapeHtml(m.text)}${meta}`;
+  }
+  return div;
+}
 
 // ---------- إقلاع ----------
 (async () => {
