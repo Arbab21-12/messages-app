@@ -24,6 +24,14 @@
     <form id="auth-form">
       <input id="auth-username" type="text" placeholder="اسم المستخدم" autocomplete="username" required>
       <input id="auth-password" type="password" placeholder="كلمة المرور" autocomplete="current-password" required>
+      <div id="reg-hints" hidden>
+        <p class="hint" id="username-hint">اسم المستخدم: يبدأ بحرف أو رقم، ويمكن أن يحتوي على حروف وأرقام و _ . - (من ٣ إلى ٢٤ حرفاً)</p>
+        <ul class="pw-checklist" id="pw-checklist">
+          <li id="pw-chk-letters"><span class="chk-mark">•</span> ٤ حروف على الأقل</li>
+          <li id="pw-chk-digit"><span class="chk-mark">•</span> رقم واحد على الأقل</li>
+          <li id="pw-chk-symbol"><span class="chk-mark">•</span> رمز واحد على الأقل (مثل ! أو #)</li>
+        </ul>
+      </div>
       <button id="auth-submit" type="submit">دخول</button>
       <p id="auth-error" class="error" hidden></p>
     </form>
@@ -75,7 +83,8 @@
   <div id="recording-bar" class="recording-bar" hidden>
     <span class="rec-dot"></span>
     <span id="rec-time">00:00</span>
-    <span class="rec-label">جارٍ التسجيل…</span>
+    <span class="rec-label" id="rec-label">جارٍ التسجيل…</span>
+    <button id="rec-pause" type="button" class="ghost" hidden>⏸ إيقاف مؤقت</button>
     <button id="rec-cancel" type="button" class="ghost">إلغاء</button>
     <button id="rec-send" type="button">إرسال</button>
   </div>

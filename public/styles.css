@@ -19,6 +19,12 @@ button:hover { background:var(--brand-dark); }
 button.ghost { background:transparent; color:var(--brand); border:1px solid var(--border); padding:8px 14px; }
 .error { color:#b3261e; margin:4px 0 0; }
 
+/* تلميحات إنشاء الحساب: قاعدة اسم المستخدم وقائمة فحص كلمة المرور */
+.hint { color:var(--muted); font-size:13px; margin:2px 0 6px; text-align:start; }
+.pw-checklist { list-style:none; margin:0; padding:0; text-align:start; font-size:13px; color:var(--muted); display:flex; flex-direction:column; gap:3px; }
+.pw-checklist .chk-mark { display:inline-block; min-width:14px; font-weight:700; }
+.pw-checklist li.ok { color:#1e7d46; }
+
 .tabs { display:flex; gap:8px; margin-bottom:14px; }
 .tab { flex:1; background:#eef2f0; color:#33413b; }
 .tab.active { background:var(--brand); color:#fff; }
@@ -75,7 +81,9 @@ button.ghost { background:transparent; color:var(--brand); border:1px solid var(
 .msg-menu #menu-del-everyone { color:#b3261e; }
 
 /* شريط التسجيل الصوتي وحالة الرفع */
-.recording-bar { display:flex; align-items:center; gap:10px; padding:10px; border-top:1px solid var(--border); background:#fff7f5; }
+.recording-bar { display:flex; align-items:center; gap:10px; padding:10px; border-top:1px solid var(--border); background:#fff7f5; flex-wrap:wrap; }
+.recording-bar.paused { background:#f4f6f5; }
+.recording-bar.paused .rec-dot { animation:none; opacity:.35; }
 .rec-dot { width:11px; height:11px; border-radius:50%; background:#c0392b; flex:none; animation:recblink 1s ease-in-out infinite; }
 @keyframes recblink { 50% { opacity:.2; } }
 .rec-label { flex:1; color:var(--muted); font-size:14px; }

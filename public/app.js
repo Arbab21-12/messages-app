@@ -32,12 +32,37 @@ function ticks(m) {
 }
 
 // ---------- الدخول ----------
+// قواعد الحساب الجديد — مرآة لقواعد الخادم (التحقق النهائي دائماً عند الخادم)
+const USERNAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{2,23}$/;
+const USERNAME_ERROR = 'اسم المستخدم يجب أن يبدأ بحرف أو رقم، ويمكن أن يحتوي على حروف وأرقام و _ . - فقط';
+function passwordMissing(pw) {
+  const missing = [];
+  if (((pw.match(/[A-Za-z]/g) || []).length) < 4) missing.push('٤ حروف على الأقل');
+  if (!/\d/.test(pw)) missing.push('رقم');
+  if (!/[^A-Za-z0-9]/.test(pw)) missing.push('رمز (مثل ! أو #)');
+  return missing;
+}
+function setPwCheck(id, ok) {
+  const li = $(id);
+  li.classList.toggle('ok', ok);
+  li.querySelector('.chk-mark').textContent = ok ? '✓' : '•';
+}
+function updatePwChecklist() {
+  const pw = $('auth-password').value;
+  setPwCheck('pw-chk-letters', ((pw.match(/[A-Za-z]/g) || []).length) >= 4);
+  setPwCheck('pw-chk-digit', /\d/.test(pw));
+  setPwCheck('pw-chk-symbol', /[^A-Za-z0-9]/.test(pw));
+}
+$('auth-password').addEventListener('input', () => { if (authMode === 'register') updatePwChecklist(); });
+
 function setAuthMode(mode) {
   authMode = mode;
   $('tab-login').classList.toggle('active', mode === 'login');
   $('tab-register').classList.toggle('active', mode === 'register');
   $('auth-submit').textContent = mode === 'login' ? 'دخول' : 'إنشاء الحساب';
   $('auth-password').autocomplete = mode === 'login' ? 'current-password' : 'new-password';
+  $('reg-hints').hidden = mode !== 'register';
+  if (mode === 'register') updatePwChecklist();
   $('auth-error').hidden = true;
 }
 $('tab-login').onclick = () => setAuthMode('login');
@@ -47,6 +72,20 @@ $('auth-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const username = $('auth-username').value.trim();
   const password = $('auth-password').value;
+  if (authMode === 'register') {
+    // تحقق فوري بنفس قواعد الخادم — دون أي فحص تركيبي عند الدخول
+    let err = null;
+    if (!USERNAME_RE.test(username)) err = USERNAME_ERROR;
+    else {
+      const missing = passwordMissing(password);
+      if (missing.length) err = 'كلمة المرور يجب أن تحتوي على: ' + missing.join(' + ');
+    }
+    if (err) {
+      $('auth-error').textContent = err;
+      $('auth-error').hidden = false;
+      return;
+    }
+  }
   try {
     const data = await api(authMode === 'login' ? '/api/login' : '/api/register', {
       method: 'POST', body: JSON.stringify({ username, password }),
@@ -422,10 +461,32 @@ $('file-input').addEventListener('change', async (e) => {
 });
 
 // ---------- تسجيل رسالة صوتية ----------
-let recorder = null, recChunks = [], recStream = null, recStartedAt = 0, recTimerInt = null, recSendOnStop = false;
+// الحد الأقصى: 60 ثانية من زمن التسجيل الفعلي — فترات الإيقاف المؤقت لا تُحسب.
+// يُتتبَّع الزمن الفعلي كمقاطع: كل مقطع بين بدء/متابعة وإيقاف مؤقت/إيقاف.
+const REC_MAX_SEC = 60;
+let recorder = null, recChunks = [], recStream = null, recTimerInt = null, recSendOnStop = false;
+let recAccumMs = 0;         // الزمن الفعلي المتراكم من المقاطع المكتملة
+let recSegmentStart = 0;    // طابع بداية المقطع الجاري (0 أثناء الإيقاف المؤقت)
+let recPaused = false;
+let recCanPause = false;
+let recStopping = false;
+let recAutoStopped = false; // توقّف تلقائياً عند بلوغ الحد الأقصى
+let recPending = null;      // { blob, durationSec } — تسجيل بلغ الحد، جاهز للإرسال/الإلغاء
+
+function recActiveMs() {
+  return recAccumMs + (recSegmentStart ? Date.now() - recSegmentStart : 0);
+}
+function recActiveSec() {
+  return Math.min(REC_MAX_SEC, Math.floor(recActiveMs() / 1000));
+}
+function setRecLabel(text) { $('rec-label').textContent = text; }
+function recUiTick() {
+  $('rec-time').textContent = fmtCallDuration(recActiveSec());
+  if (!recPaused && recActiveMs() >= REC_MAX_SEC * 1000) hitRecLimit();
+}
 
 async function startRecording() {
-  if (recorder || uploading) return;
+  if (recorder || recPending || uploading) return;
   let stream;
   try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
   catch { alert('تعذّر الوصول إلى الميكروفون. تحقّق من أذونات المتصفح ثم حاول مرة أخرى.'); return; }
@@ -438,39 +499,120 @@ async function startRecording() {
     alert('التسجيل الصوتي غير مدعوم في هذا المتصفح');
     return;
   }
+  // دعم الإيقاف المؤقت/المتابعة يختلف بين المتصفحات — يُخفى الزر عند غيابه
+  recCanPause = typeof recorder.pause === 'function' && typeof recorder.resume === 'function';
   recorder.ondataavailable = (e) => { if (e.data && e.data.size) recChunks.push(e.data); };
   recorder.onstop = finishRecording;
+  recAccumMs = 0;
+  recPaused = false;
+  recStopping = false;
+  recAutoStopped = false;
   recorder.start();
-  recStartedAt = Date.now();
+  recSegmentStart = Date.now();
   $('rec-time').textContent = '00:00';
+  setRecLabel('جارٍ التسجيل…');
+  $('recording-bar').classList.remove('paused');
+  $('rec-pause').hidden = !recCanPause;
+  $('rec-pause').textContent = '⏸ إيقاف مؤقت';
   $('recording-bar').hidden = false;
-  recTimerInt = setInterval(() => { $('rec-time').textContent = fmtCallDuration(Math.floor((Date.now() - recStartedAt) / 1000)); }, 250);
+  recTimerInt = setInterval(recUiTick, 250);
 }
+
+function hitRecLimit() {
+  if (!recorder || recStopping || recAutoStopped) return;
+  recAutoStopped = true;
+  stopRecording(true);
+}
+
+function toggleRecPause() {
+  if (!recorder || !recCanPause) return;
+  try {
+    if (!recPaused && recorder.state === 'recording') {
+      recorder.pause();
+      recAccumMs += Date.now() - recSegmentStart;
+      recSegmentStart = 0;
+      recPaused = true;
+      $('rec-pause').textContent = '▶ متابعة';
+      setRecLabel('متوقف مؤقتاً');
+      $('recording-bar').classList.add('paused');
+    } else if (recPaused && recorder.state === 'paused') {
+      recorder.resume();
+      recSegmentStart = Date.now();
+      recPaused = false;
+      $('rec-pause').textContent = '⏸ إيقاف مؤقت';
+      setRecLabel('جارٍ التسجيل…');
+      $('recording-bar').classList.remove('paused');
+    }
+  } catch {
+    // متصفح يعرض الدالتين ثم يرمي استثناءً عند الاستدعاء — عطّل الزر بصمت
+    recCanPause = false;
+    $('rec-pause').hidden = true;
+  }
+}
+
 function stopRecording(send) {
-  if (!recorder) return;
+  if (!recorder || recStopping) return;
+  recStopping = true;
   recSendOnStop = send;
   try { recorder.stop(); } catch { finishRecording(); }
 }
-async function finishRecording() {
-  if (recTimerInt) { clearInterval(recTimerInt); recTimerInt = null; }
+
+function resetRecBar() {
   $('recording-bar').hidden = true;
-  if (recStream) { recStream.getTracks().forEach((t) => t.stop()); recStream = null; }
-  const shouldSend = recSendOnStop;
-  const chunks = recChunks; recChunks = [];
-  const rec = recorder; recorder = null; recSendOnStop = false;
-  if (!shouldSend || !chunks.length || !currentChat) return;
-  const type = (rec && rec.mimeType) || 'audio/webm';
-  const blob = new Blob(chunks, { type });
-  const durationSec = Math.max(1, Math.round((Date.now() - recStartedAt) / 1000));
+  $('recording-bar').classList.remove('paused');
+  $('rec-pause').hidden = true;
+}
+
+async function sendVoiceBlob(blob, durationSec) {
+  const type = blob.type || 'audio/webm';
   const ext = type.includes('mp4') ? 'm4a' : type.includes('ogg') ? 'ogg' : type.includes('mpeg') ? 'mp3' : type.includes('wav') ? 'wav' : 'webm';
   try {
     const up = await uploadFile(blob, 'voice.' + ext);
     sendMediaMessage('voice', up.fileId, durationSec);
   } catch (err) { alert(err.message || 'فشل رفع التسجيل'); }
 }
+async function finishRecording() {
+  recStopping = false;
+  if (recTimerInt) { clearInterval(recTimerInt); recTimerInt = null; }
+  if (recStream) { recStream.getTracks().forEach((t) => t.stop()); recStream = null; }
+  const shouldSend = recSendOnStop;
+  const autoStopped = recAutoStopped;
+  const chunks = recChunks; recChunks = [];
+  const rec = recorder; recorder = null; recSendOnStop = false; recAutoStopped = false;
+  // المدة المُرسلة = زمن التسجيل الفعلي فقط (دون فترات الإيقاف المؤقت)، بسقف 60 ثانية
+  const durationSec = Math.min(REC_MAX_SEC, Math.max(1, Math.round(recActiveMs() / 1000)));
+  recAccumMs = 0; recSegmentStart = 0; recPaused = false;
+  if (!chunks.length) { resetRecBar(); return; }
+  const type = (rec && rec.mimeType) || 'audio/webm';
+  const blob = new Blob(chunks, { type });
+  if (autoStopped) {
+    // بلغ الحد الأقصى فتوقّف تلقائياً: التسجيل جاهز الآن — بانتظار «إرسال» أو «إلغاء»
+    recPending = { blob, durationSec };
+    $('rec-time').textContent = fmtCallDuration(durationSec);
+    setRecLabel('وصلت إلى الحد الأقصى: دقيقة واحدة');
+    $('rec-pause').hidden = true;
+    $('recording-bar').classList.remove('paused');
+    $('recording-bar').hidden = false;
+    return;
+  }
+  resetRecBar();
+  if (!shouldSend || !currentChat) return;
+  await sendVoiceBlob(blob, durationSec);
+}
 $('mic-btn').onclick = startRecording;
-$('rec-cancel').onclick = () => stopRecording(false);
-$('rec-send').onclick = () => stopRecording(true);
+$('rec-pause').onclick = toggleRecPause;
+$('rec-cancel').onclick = () => {
+  if (recPending) { recPending = null; resetRecBar(); return; }
+  stopRecording(false);
+};
+$('rec-send').onclick = async () => {
+  if (recPending) {
+    const pending = recPending; recPending = null; resetRecBar();
+    if (currentChat) await sendVoiceBlob(pending.blob, pending.durationSec);
+    return;
+  }
+  stopRecording(true);
+};
 
 function updatePresenceUI() {
   if (!currentChat) return;
