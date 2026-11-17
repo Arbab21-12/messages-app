@@ -2,8 +2,10 @@
 // ثم يتحقق من: التسجيل، رفض التكرار وكلمة المرور الخاطئة، الإرسال اللحظي عبر
 // WebSocket، سجل المحادثة، إشعار القراءة، والرسائل أثناء عدم الاتصال، وقواعد
 // الحساب الجديد (بداية اسم المستخدم وقوة كلمة المرور عند التسجيل فقط)، وطول
-// الاسم 1–24 وحساسية حالة الأحرف، والصورة الشخصية، وتغيير اسم المستخدم مع
-// حجز الاسم القديم ٣ أيام وانتهاء الحجز (بإعادة تشغيل الخادم على نفس البيانات).
+// الاسم 1–24 وحساسية حالة الأحرف، والصورة الشخصية، وعرض ملف مستخدم
+// (GET /api/users/:username)، وتغيير اسم المستخدم (الاسم المُخلى متاح فوراً —
+// لا مهلة حجز)، وإعادة التفاوض (عرض/جواب ثانٍ) أثناء مكالمة قائمة، ولوحة
+// بيانات المالك (ADMIN_USERNAME=admin_test في بيئة خادم الاختبار).
 // التشغيل: npm test
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -61,16 +63,16 @@ function connectWs(token) {
 }
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function startServer() {
+function startServer(extraEnv = {}) {
   const s = spawn('node', ['server.js'], {
     cwd: root,
-    env: { ...process.env, PORT: String(PORT), DATA_DIR: dataDir },
+    env: { ...process.env, PORT: String(PORT), DATA_DIR: dataDir, ...extraEnv },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   s.stderr.on('data', (d) => process.stderr.write('[server] ' + d));
   return s;
 }
-let server = startServer();
+let server = startServer({ ADMIN_USERNAME: 'admin_test' });
 async function waitUp() {
   for (let i = 0; i < 50; i++) {
     try { const r = await fetch(BASE + '/api/health'); if (r.ok) return true; } catch { await wait(200); }
@@ -165,6 +167,14 @@ try {
   B2.send({ type: 'call_ice', to: 'omar_test', candidate: iceCand });
   const iceA = await A.waitFor((m) => m.type === 'call_ice').catch(() => null);
   check('مرشح ICE من B يصل إلى A سليماً', !!iceA && iceA.candidate?.candidate === iceCand.candidate);
+
+  // إعادة تفاوض أثناء مكالمة قائمة (ترقية صوت→فيديو): عرض/جواب ثانٍ يُمرَّر بين الطرفين
+  A.send({ type: 'call_offer', to: 'sara_test', sdp: { type: 'offer', sdp: 'FAKE_RENEGO_OFFER' } });
+  const renegoOffer = await B2.waitFor((m) => m.type === 'call_offer' && m.sdp?.sdp === 'FAKE_RENEGO_OFFER').catch(() => null);
+  check('عرض إعادة التفاوض أثناء المكالمة يصل إلى B سليماً', !!renegoOffer && renegoOffer.from === 'omar_test');
+  B2.send({ type: 'call_answer', to: 'omar_test', sdp: { type: 'answer', sdp: 'FAKE_RENEGO_ANSWER' } });
+  const renegoAnswer = await A.waitFor((m) => m.type === 'call_answer' && m.sdp?.sdp === 'FAKE_RENEGO_ANSWER').catch(() => null);
+  check('جواب إعادة التفاوض أثناء المكالمة يصل إلى A سليماً', !!renegoAnswer && renegoAnswer.from === 'sara_test');
 
   // إنهاء مكالمة متصلة مع مدة 125 ثانية → سجل واحد فقط يذكر «02:05»
   A.send({ type: 'call_end', to: 'sara_test', duration: 125 });
@@ -340,7 +350,15 @@ try {
   const avatarNonImage = await api('/api/me/avatar', { method: 'POST', token: tokA, body: { fileId: upAudio.data.fileId } });
   check('تعيين ملف غير صورة (صوت) صورةً شخصية يُرفض 400', avatarNonImage.status === 400, `status=${avatarNonImage.status}`);
 
-  // 14) تغيير اسم المستخدم + حجز الاسم القديم ٣ أيام + انتهاء الحجز
+  // عرض ملف مستخدم: الاسم + الصورة + حالة الاتصال (A متصل عبر WebSocket الآن)
+  const profView = await api('/api/users/omar_test', { token: tokB2 });
+  check('GET /api/users/:username يعرض الاسم والصورة وحالة الاتصال',
+    profView.status === 200 && profView.data.username === 'omar_test' && profView.data.avatar === avatarUrl && profView.data.online === true,
+    `status=${profView.status} data=${JSON.stringify(profView.data)}`);
+  const prof404 = await api('/api/users/no_such_user_x', { token: tokB2 });
+  check('GET /api/users/:username لمستخدم غير موجود يُرجع 404', prof404.status === 404, `status=${prof404.status}`);
+
+  // 14) تغيير اسم المستخدم — الاسم المُخلى متاح فوراً لأي شخص (لا مهلة حجز)
   const rename1 = await api('/api/me/username', { method: 'POST', token: tokB2, body: { username: 'sara_new' } });
   check('sara_test تغيّر اسمها إلى sara_new', rename1.status === 200 && rename1.data.user?.username === 'sara_new', `status=${rename1.status}`);
   const meRenamed = await api('/api/me', { token: tokB2 });
@@ -351,33 +369,55 @@ try {
   const histRenamed = await api('/api/messages/sara_new', { token: tokA });
   check('السجل القديم سليم تحت الاسم الجديد (رسالة الاختبار موجودة)',
     histRenamed.data.messages?.some((m) => m.text.includes('رسالة اختبار')));
-  const regReserved = await api('/api/register', { method: 'POST', body: { username: 'sara_test', password: STRONG } });
-  check('تسجيل حساب جديد بالاسم المُخلى المحجوز يُرفض مع رسالة الحجز',
-    regReserved.status === 409 && (regReserved.data.error || '').includes('محجوز'), `status=${regReserved.status} err=${regReserved.data.error || ''}`);
-  const stealReserved = await api('/api/me/username', { method: 'POST', token: tokA, body: { username: 'sara_test' } });
-  check('تغيير اسم omar إلى الاسم المحجوز لغيره يُرفض مع رسالة الحجز',
-    stealReserved.status === 409 && (stealReserved.data.error || '').includes('محجوز'), `status=${stealReserved.status}`);
-  const renameBack = await api('/api/me/username', { method: 'POST', token: tokB2, body: { username: 'sara_test' } });
-  check('صاحبة الاسم ترجع إلى اسمها المحجوز خلال الحجز', renameBack.status === 200 && renameBack.data.user?.username === 'sara_test', `status=${renameBack.status}`);
-  const rename2 = await api('/api/me/username', { method: 'POST', token: tokB2, body: { username: 'sara_new2' } });
-  check('تغيير الاسم مجدداً إلى sara_new2 (يُنشئ حجزاً جديداً لـ sara_test)', rename2.status === 200 && rename2.data.user?.username === 'sara_new2', `status=${rename2.status}`);
+  const regOldName = await api('/api/register', { method: 'POST', body: { username: 'sara_test', password: STRONG } });
+  check('الاسم المُخلى متاح للتسجيل فوراً بعد تغيير الاسم (لا مهلة حجز)',
+    regOldName.status === 201 && !!regOldName.data.token, `status=${regOldName.status} err=${regOldName.data.error || ''}`);
+  const stealNowTaken = await api('/api/me/username', { method: 'POST', token: tokA, body: { username: 'sara_test' } });
+  check('تغيير الاسم إلى اسم صار مملوكاً لحساب آخر يُرفض برسالة «مستخدم من قبل»',
+    stealNowTaken.status === 409 && (stealNowTaken.data.error || '').includes('مستخدم من قبل'),
+    `status=${stealNowTaken.status} err=${stealNowTaken.data.error || ''}`);
 
-  // انتهاء الحجز: نوقف الخادم ونرجع بتاريخ الحجز في ملف البيانات إلى الماضي، ثم نعيد التشغيل
-  server.kill();
-  await wait(700);
-  const dataFile = path.join(dataDir, 'data.json');
-  const stored = JSON.parse(fs.readFileSync(dataFile, 'utf8'));
-  const resvEntry = (stored.nameReservations || []).find((r) => r.name === 'sara_test');
-  check('سجل حجز sara_test موجود في ملف البيانات', !!resvEntry, JSON.stringify(stored.nameReservations || []));
-  if (resvEntry) {
-    resvEntry.until = Date.now() - 1000;
-    fs.writeFileSync(dataFile, JSON.stringify(stored, null, 2), 'utf8');
-  }
-  server = startServer();
-  const upAgain = await waitUp();
-  check('الخادم عاد بعد إعادة التشغيل', upAgain);
-  const regAfterExpiry = await api('/api/register', { method: 'POST', body: { username: 'sara_test', password: STRONG } });
-  check('بعد انتهاء الحجز يصبح الاسم متاحاً للتسجيل من جديد', regAfterExpiry.status === 201 && !!regAfterExpiry.data.token, `status=${regAfterExpiry.status}`);
+  // 15) لوحة بيانات المالك — الخادم يعمل بـ ADMIN_USERNAME=admin_test
+  const regAdmin = await api('/api/register', { method: 'POST', body: { username: 'admin_test', password: 'Admin1234!' } });
+  check('تسجيل admin_test (المالك)', regAdmin.status === 201 && !!regAdmin.data.token, `status=${regAdmin.status}`);
+  const tokAdmin = regAdmin.data.token;
+  const regPlain = await api('/api/register', { method: 'POST', body: { username: 'plain_user', password: 'Plain1234!' } });
+  check('تسجيل plain_user (مستخدم عادي)', regPlain.status === 201 && !!regPlain.data.token, `status=${regPlain.status}`);
+  const tokPlain = regPlain.data.token;
+  const mePlain = await api('/api/me', { token: tokPlain });
+  check('/api/me للمستخدم العادي: isAdmin=false', mePlain.data.user?.isAdmin === false, JSON.stringify(mePlain.data.user || {}));
+  const meAdmin = await api('/api/me', { token: tokAdmin });
+  check('/api/me للمالك: isAdmin=true', meAdmin.data.user?.isAdmin === true, JSON.stringify(meAdmin.data.user || {}));
+  const adminForbidden = await api('/api/admin/overview', { token: tokPlain });
+  check('نقاط الإدارة محرّمة على غير المالك (403)', adminForbidden.status === 403, `status=${adminForbidden.status}`);
+  // زرع محادثة بين العادي والمالك: رسالة نصية + رسالة صورة
+  const plainText = await api('/api/messages/admin_test', { method: 'POST', token: tokPlain, body: { text: 'رسالة للوحة البيانات' } });
+  check('plain_user يرسل رسالة نصية إلى admin_test', plainText.status === 201, `status=${plainText.status}`);
+  const upAdminImg = await uploadRaw(PNG_BYTES, { token: tokPlain, mime: 'image/png', name: 'admin-pixel.png' });
+  check('plain_user يرفع صورة (لرسالة اللوحة)', upAdminImg.status === 201 && !!upAdminImg.data.fileId, `status=${upAdminImg.status}`);
+  const plainImg = await api('/api/messages/admin_test', { method: 'POST', token: tokPlain, body: { kind: 'image', fileId: upAdminImg.data.fileId } });
+  check('plain_user يرسل رسالة الصورة إلى admin_test', plainImg.status === 201 && plainImg.data.message?.kind === 'image', `status=${plainImg.status}`);
+  const ovAdmin = await api('/api/admin/overview', { token: tokAdmin });
+  check('نظرة عامة الإدارة: الأعداد تغطي البيانات المزروعة',
+    ovAdmin.status === 200 && ovAdmin.data.users >= 2 && ovAdmin.data.messages >= 2 && ovAdmin.data.uploads >= 1 && ovAdmin.data.uploadBytes >= PNG_BYTES.length,
+    `status=${ovAdmin.status} data=${JSON.stringify(ovAdmin.data)}`);
+  const usersAdmin = await api('/api/admin/users', { token: tokAdmin });
+  check('قائمة مستخدمي الإدارة تتضمن admin_test و plain_user',
+    usersAdmin.data.users?.some((u) => u.username === 'admin_test') && usersAdmin.data.users?.some((u) => u.username === 'plain_user'),
+    `status=${usersAdmin.status}`);
+  const convsAdmin = await api('/api/admin/conversations', { token: tokAdmin });
+  const pairKey = (x, y) => [x, y].sort().join('|');
+  const pairRow = convsAdmin.data.conversations?.find((c) => pairKey(c.a, c.b) === pairKey('admin_test', 'plain_user'));
+  check('محادثات الإدارة تعرض الزوج admin_test/plain_user بعدّاد ≥ 2', !!pairRow && pairRow.count >= 2, JSON.stringify(pairRow || {}));
+  const msgsAdmin = await api('/api/admin/messages?a=plain_user&b=admin_test', { token: tokAdmin });
+  check('رسائل الإدارة بين الزوج تتضمن النصية والصورة مع رابط ملفها',
+    msgsAdmin.data.messages?.some((m) => m.kind === 'text' && m.text.includes('للوحة البيانات')) &&
+    msgsAdmin.data.messages?.some((m) => m.kind === 'image' && m.fileUrl === '/files/' + upAdminImg.data.fileId),
+    `status=${msgsAdmin.status}`);
+  const uploadsAdmin = await api('/api/admin/uploads', { token: tokAdmin });
+  const upRow = uploadsAdmin.data.uploads?.find((u) => u.id === upAdminImg.data.fileId);
+  check('قائمة ملفات الإدارة تتضمن الصورة بمالكها الصحيح plain_user',
+    !!upRow && upRow.owner === 'plain_user' && upRow.mime === 'image/png', JSON.stringify(upRow || {}));
 
   B2.close();
   A.close();
