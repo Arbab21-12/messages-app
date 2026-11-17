@@ -34,7 +34,28 @@
       </div>
       <button id="auth-submit" type="submit">دخول</button>
       <p id="auth-error" class="error" hidden></p>
+      <p id="auth-ok" class="ok" hidden></p>
     </form>
+    <button id="forgot-link" type="button" class="link-btn">نسيت كلمة السر؟</button>
+    <!-- عرض استعادة كلمة السر بالبريد -->
+    <div id="reset-view" hidden>
+      <h2 class="reset-title">استعادة كلمة السر</h2>
+      <input id="reset-username" type="text" placeholder="اسم المستخدم" autocomplete="username">
+      <button id="reset-send" type="button">إرسال رمز الاستعادة</button>
+      <p id="reset-msg" class="hint" hidden></p>
+      <p id="reset-error" class="error" hidden></p>
+      <div id="reset-step2" hidden>
+        <input id="reset-code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="رمز الاستعادة (٦ أرقام)">
+        <input id="reset-password" type="password" placeholder="كلمة السر الجديدة" autocomplete="new-password">
+        <ul class="pw-checklist">
+          <li id="reset-chk-letters"><span class="chk-mark">•</span> ٤ حروف على الأقل</li>
+          <li id="reset-chk-digit"><span class="chk-mark">•</span> رقم واحد على الأقل</li>
+          <li id="reset-chk-symbol"><span class="chk-mark">•</span> رمز واحد على الأقل (مثل ! أو #)</li>
+        </ul>
+        <button id="reset-submit" type="button">تعيين كلمة سر جديدة</button>
+      </div>
+      <button id="reset-back" type="button" class="link-btn">عودة للدخول</button>
+    </div>
   </div>
 </section>
 
@@ -140,6 +161,34 @@
       <button type="submit">حفظ الاسم الجديد</button>
       <p id="profile-error" class="error" hidden></p>
       <p id="profile-ok" class="ok" hidden></p>
+    </form>
+    <hr class="profile-sep">
+    <div id="email-section">
+      <span class="profile-label">📧 البريد الإلكتروني</span>
+      <p id="email-status" class="hint"></p>
+      <input id="email-input" type="email" placeholder="بريدك الإلكتروني" autocomplete="email">
+      <button id="email-send" type="button">إرسال رمز التأكيد</button>
+      <div id="email-code-row" hidden>
+        <input id="email-code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="رمز التأكيد (٦ أرقام)">
+        <button id="email-verify" type="button">تأكيد</button>
+      </div>
+      <p id="email-error" class="error" hidden></p>
+      <p id="email-ok" class="ok" hidden></p>
+    </div>
+    <hr class="profile-sep">
+    <form id="password-form">
+      <label for="pw-current" class="profile-label">🔑 تغيير كلمة السر</label>
+      <input id="pw-current" type="password" placeholder="كلمة السر الحالية" autocomplete="current-password">
+      <input id="pw-new" type="password" placeholder="كلمة السر الجديدة" autocomplete="new-password">
+      <ul class="pw-checklist">
+        <li id="pwc-chk-letters"><span class="chk-mark">•</span> ٤ حروف على الأقل</li>
+        <li id="pwc-chk-digit"><span class="chk-mark">•</span> رقم واحد على الأقل</li>
+        <li id="pwc-chk-symbol"><span class="chk-mark">•</span> رمز واحد على الأقل (مثل ! أو #)</li>
+      </ul>
+      <input id="pw-confirm" type="password" placeholder="تأكيد كلمة السر الجديدة" autocomplete="new-password">
+      <button type="submit">تغيير كلمة السر</button>
+      <p id="pw-error" class="error" hidden></p>
+      <p id="pw-ok" class="ok" hidden></p>
     </form>
     <hr class="profile-sep">
     <p class="hint privacy-note">حماية الخصوصية: نمنع حفظ الصور من داخل التطبيق ونخفي المحتوى عند تبديل التطبيقات. ملاحظة: لا يمكن لأي موقع ويب منع لقطات شاشة نظام التشغيل منعاً كاملاً — الحظر الكامل يحتاج نسخة التطبيق الأصلية (أندرويد/آيفون)</p>

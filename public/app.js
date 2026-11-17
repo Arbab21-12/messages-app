@@ -167,11 +167,13 @@ function setPwCheck(id, ok) {
   li.classList.toggle('ok', ok);
   li.querySelector('.chk-mark').textContent = ok ? '✓' : '•';
 }
+function applyPwChecklist(pw, ids) {
+  setPwCheck(ids.letters, ((pw.match(/[A-Za-z]/g) || []).length) >= 4);
+  setPwCheck(ids.digit, /\d/.test(pw));
+  setPwCheck(ids.symbol, /[^A-Za-z0-9]/.test(pw));
+}
 function updatePwChecklist() {
-  const pw = $('auth-password').value;
-  setPwCheck('pw-chk-letters', ((pw.match(/[A-Za-z]/g) || []).length) >= 4);
-  setPwCheck('pw-chk-digit', /\d/.test(pw));
-  setPwCheck('pw-chk-symbol', /[^A-Za-z0-9]/.test(pw));
+  applyPwChecklist($('auth-password').value, { letters: 'pw-chk-letters', digit: 'pw-chk-digit', symbol: 'pw-chk-symbol' });
 }
 $('auth-password').addEventListener('input', () => { if (authMode === 'register') updatePwChecklist(); });
 
@@ -184,6 +186,13 @@ function setAuthMode(mode) {
   $('reg-hints').hidden = mode !== 'register';
   if (mode === 'register') updatePwChecklist();
   $('auth-error').hidden = true;
+  $('auth-ok').hidden = true;
+  // أي تبديل وضع يغلق عرض الاستعادة ويرجع نموذج الدخول
+  $('reset-view').hidden = true;
+  $('auth-form').hidden = false;
+  const tabsEl = document.querySelector('#auth-screen .tabs');
+  if (tabsEl) tabsEl.hidden = false;
+  $('forgot-link').hidden = mode !== 'login';
 }
 $('tab-login').onclick = () => setAuthMode('login');
 $('tab-register').onclick = () => setAuthMode('register');
@@ -218,6 +227,79 @@ $('auth-form').addEventListener('submit', async (e) => {
     $('auth-error').hidden = false;
   }
 });
+
+// ---------- استعادة كلمة السر بالبريد (من شاشة الدخول) ----------
+const MAIL_DISABLED_NOTE = 'إرسال البريد غير مفعّل بعد — بانتظار إعداد المالك لحساب Gmail';
+function mailDisabledNote(err) {
+  return err && String(err.message || '').includes('غير مفعّل') ? MAIL_DISABLED_NOTE : (err.message || 'حدث خطأ');
+}
+function showResetView(on) {
+  $('reset-view').hidden = !on;
+  $('auth-form').hidden = on;
+  $('forgot-link').hidden = on || authMode !== 'login';
+  const tabsEl = document.querySelector('#auth-screen .tabs');
+  if (tabsEl) tabsEl.hidden = on;
+}
+$('forgot-link').onclick = () => {
+  $('auth-error').hidden = true;
+  $('auth-ok').hidden = true;
+  $('reset-username').value = $('auth-username').value.trim();
+  $('reset-code').value = '';
+  $('reset-password').value = '';
+  applyPwChecklist('', { letters: 'reset-chk-letters', digit: 'reset-chk-digit', symbol: 'reset-chk-symbol' });
+  $('reset-msg').hidden = true;
+  $('reset-error').hidden = true;
+  $('reset-step2').hidden = true;
+  showResetView(true);
+};
+$('reset-back').onclick = () => { showResetView(false); setAuthMode('login'); };
+$('reset-send').onclick = async () => {
+  const username = $('reset-username').value.trim();
+  $('reset-error').hidden = true;
+  $('reset-msg').hidden = true;
+  if (!username) {
+    $('reset-error').textContent = 'أدخل اسم المستخدم أولاً';
+    $('reset-error').hidden = false;
+    return;
+  }
+  try {
+    await api('/api/password/forgot', { method: 'POST', body: JSON.stringify({ username }) });
+    // رسالة عامة ثابتة — لا تكشف إن وُجد الحساب أو بريده
+    $('reset-msg').textContent = 'إن وُجد حساب بهذا الاسم وله بريد مؤكد، أرسلنا رمز الاستعادة إليه';
+    $('reset-msg').hidden = false;
+    $('reset-step2').hidden = false;
+  } catch (err) {
+    $('reset-error').textContent = mailDisabledNote(err);
+    $('reset-error').hidden = false;
+  }
+};
+$('reset-password').addEventListener('input', () => {
+  applyPwChecklist($('reset-password').value, { letters: 'reset-chk-letters', digit: 'reset-chk-digit', symbol: 'reset-chk-symbol' });
+});
+$('reset-submit').onclick = async () => {
+  const username = $('reset-username').value.trim();
+  const code = $('reset-code').value.trim();
+  const newPassword = $('reset-password').value;
+  $('reset-error').hidden = true;
+  const missing = passwordMissing(newPassword);
+  if (missing.length) {
+    $('reset-error').textContent = 'كلمة المرور يجب أن تحتوي على: ' + missing.join(' + ');
+    $('reset-error').hidden = false;
+    return;
+  }
+  try {
+    await api('/api/password/reset', { method: 'POST', body: JSON.stringify({ username, code, newPassword }) });
+    showResetView(false);
+    setAuthMode('login');
+    $('auth-username').value = username;
+    $('auth-password').value = '';
+    $('auth-ok').textContent = 'تم تعيين كلمة السر — سجّل الدخول الآن';
+    $('auth-ok').hidden = false;
+  } catch (err) {
+    $('reset-error').textContent = err.message;
+    $('reset-error').hidden = false;
+  }
+};
 
 $('logout-btn').onclick = async () => {
   cleanupCall();
@@ -1224,6 +1306,13 @@ function openProfile() {
   $('new-username').value = '';
   $('profile-error').hidden = true;
   $('profile-ok').hidden = true;
+  syncEmailSection();
+  $('pw-current').value = '';
+  $('pw-new').value = '';
+  $('pw-confirm').value = '';
+  $('pw-error').hidden = true;
+  $('pw-ok').hidden = true;
+  applyPwChecklist('', { letters: 'pwc-chk-letters', digit: 'pwc-chk-digit', symbol: 'pwc-chk-symbol' });
   $('profile-panel').hidden = false;
 }
 function closeProfile() { $('profile-panel').hidden = true; }
@@ -1286,6 +1375,96 @@ $('username-form').addEventListener('submit', async (e) => {
   } catch (err) {
     $('profile-error').textContent = err.message || 'فشل تغيير الاسم';
     $('profile-error').hidden = false;
+  }
+});
+
+// ---------- الملف الشخصي: البريد الإلكتروني المؤكد ----------
+function syncEmailSection() {
+  if (!me) return;
+  $('email-error').hidden = true;
+  $('email-ok').hidden = true;
+  if (me.emailVerified && me.email) {
+    $('email-status').textContent = 'بريدك المؤكد: ' + me.email + ' ✓ مؤكد — لربط بريد آخر أدخله أدناه وأرسل رمزاً جديداً';
+  } else if (me.pendingEmail) {
+    $('email-status').textContent = 'بانتظار تأكيد: ' + me.pendingEmail + ' — أدخل الرمز المُرسل إليه';
+  } else {
+    $('email-status').textContent = 'لا يوجد بريد مؤكد بعد — اربط بريدك لتتمكن من استعادة كلمة السر عند نسيانها';
+  }
+  $('email-input').value = me.pendingEmail || '';
+  $('email-code').value = '';
+  $('email-code-row').hidden = !me.pendingEmail;
+}
+$('email-send').onclick = async () => {
+  const email = $('email-input').value.trim();
+  $('email-error').hidden = true;
+  $('email-ok').hidden = true;
+  if (!email) {
+    $('email-error').textContent = 'أدخل بريدك الإلكتروني أولاً';
+    $('email-error').hidden = false;
+    return;
+  }
+  try {
+    await api('/api/me/email', { method: 'POST', body: JSON.stringify({ email }) });
+    me.pendingEmail = email.toLowerCase();
+    $('email-status').textContent = 'أرسلنا رمز التأكيد إلى ' + me.pendingEmail + ' — أدخل الرمز (صالح ١٠ دقائق)';
+    $('email-code-row').hidden = false;
+    $('email-ok').textContent = 'تم إرسال رمز التأكيد';
+    $('email-ok').hidden = false;
+  } catch (err) {
+    $('email-error').textContent = mailDisabledNote(err);
+    $('email-error').hidden = false;
+  }
+};
+$('email-verify').onclick = async () => {
+  const code = $('email-code').value.trim();
+  $('email-error').hidden = true;
+  $('email-ok').hidden = true;
+  try {
+    const data = await api('/api/me/email/verify', { method: 'POST', body: JSON.stringify({ code }) });
+    me.email = data.email;
+    me.emailVerified = true;
+    me.pendingEmail = null;
+    syncEmailSection();
+    $('email-ok').textContent = 'تم تأكيد البريد: ' + data.email + ' ✓';
+    $('email-ok').hidden = false;
+  } catch (err) {
+    $('email-error').textContent = err.message;
+    $('email-error').hidden = false;
+  }
+};
+
+// ---------- الملف الشخصي: تغيير كلمة السر ----------
+$('pw-new').addEventListener('input', () => {
+  applyPwChecklist($('pw-new').value, { letters: 'pwc-chk-letters', digit: 'pwc-chk-digit', symbol: 'pwc-chk-symbol' });
+});
+$('password-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  $('pw-error').hidden = true;
+  $('pw-ok').hidden = true;
+  const currentPassword = $('pw-current').value;
+  const newPassword = $('pw-new').value;
+  const missing = passwordMissing(newPassword);
+  if (missing.length) {
+    $('pw-error').textContent = 'كلمة المرور يجب أن تحتوي على: ' + missing.join(' + ');
+    $('pw-error').hidden = false;
+    return;
+  }
+  if (newPassword !== $('pw-confirm').value) {
+    $('pw-error').textContent = 'تأكيد كلمة السر الجديدة غير متطابق';
+    $('pw-error').hidden = false;
+    return;
+  }
+  try {
+    await api('/api/me/password', { method: 'POST', body: JSON.stringify({ currentPassword, newPassword }) });
+    $('pw-current').value = '';
+    $('pw-new').value = '';
+    $('pw-confirm').value = '';
+    applyPwChecklist('', { letters: 'pwc-chk-letters', digit: 'pwc-chk-digit', symbol: 'pwc-chk-symbol' });
+    $('pw-ok').textContent = 'تم تغيير كلمة السر';
+    $('pw-ok').hidden = false;
+  } catch (err) {
+    $('pw-error').textContent = err.message;
+    $('pw-error').hidden = false;
   }
 });
 
@@ -1356,17 +1535,25 @@ async function openAdmin() {
     show('main-screen');
   }
 }
+/** رابط ملف في لوحة البيانات: الملفات المُحتجَزة (محذوفة لدى الجميع) لا تُفتح
+ *  إلا برمز جلسة المالك في الاستعلام ?t= — وغيرها يبقى رابطها العادي. */
+function adminFileUrl(url, retained) {
+  if (!url) return url;
+  return retained ? url + '?t=' + encodeURIComponent(token || '') : url;
+}
 function adminUploadItem(u) {
   const item = document.createElement('div');
   item.className = 'admin-upload';
-  const cap = `<div>${escapeHtml(u.owner || '؟')} · ${fmtBytes(u.size)}</div>`;
+  const url = adminFileUrl(u.url, u.retained);
+  const badge = u.retained ? ` <span class="admin-deleted-tag">محذوفة — محفوظة للمالك</span>` : '';
+  const cap = `<div>${escapeHtml(u.owner || '؟')} · ${fmtBytes(u.size)}${badge}</div>`;
   if ((u.mime || '').startsWith('image/')) {
-    item.innerHTML = `<img src="${u.url}" alt="" draggable="false" loading="lazy">${cap}`;
-    item.querySelector('img').onclick = () => openImageViewer(u.url);
+    item.innerHTML = `<img src="${url}" alt="" draggable="false" loading="lazy">${cap}`;
+    item.querySelector('img').onclick = () => openImageViewer(url);
   } else {
     const icon = (u.mime || '').startsWith('video/') ? '🎥' : (u.mime || '').startsWith('audio/') ? '🎤' : '📄';
     const label = (u.mime || '').startsWith('video/') ? 'فيديو' : (u.mime || '').startsWith('audio/') ? 'صوت' : 'ملف';
-    item.innerHTML = `<a href="${u.url}" target="_blank" rel="noopener">${icon}<span>${label}</span></a>${cap}`;
+    item.innerHTML = `<a href="${url}" target="_blank" rel="noopener">${icon}<span>${label}</span></a>${cap}`;
   }
   return item;
 }
@@ -1382,7 +1569,9 @@ async function openAdminThread(a, b) {
     $('admin-thread').scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (err) { alert(err.message || 'فشل تحميل المحادثة'); }
 }
-/** عرض رسالة في لوحة المالك (للقراءة فقط) — بنفس أشكال المحادثة، مع وسم «محذوفة». */
+/** عرض رسالة في لوحة المالك (للقراءة فقط) — بنفس أشكال المحادثة. الرسالة المحذوفة
+ *  لدى الجميع تُعرض هنا بمحتواها الأصلي كاملاً مع وسم أحمر «محذوفة لدى الجميع»،
+ *  وملفها المُحتجَز يُفتح برمز جلسة المالك (?t=). */
 function renderAdminMessage(m, userA) {
   if (m.kind === 'call' && !m.deleted) {
     const div = document.createElement('div');
@@ -1393,22 +1582,27 @@ function renderAdminMessage(m, userA) {
   const div = document.createElement('div');
   div.className = 'bubble ' + (m.from === userA ? 'mine' : 'theirs');
   const meta = `<span class="meta">${escapeHtml(m.from || '')} · ${fmtTime(m.ts)}</span>`;
-  if (m.deleted) {
-    div.classList.add('deleted');
-    div.innerHTML = `<span class="deleted-text">🚫 تم حذف هذه الرسالة</span> <span class="admin-deleted-tag">محذوفة</span>${meta}`;
-  } else if (m.kind === 'image') {
+  const delTag = m.deleted
+    ? ` <span class="admin-deleted-tag">محذوفة لدى الجميع${m.deletedAt ? ' · ' + fmtTime(m.deletedAt) : ''}</span>`
+    : '';
+  const fileUrl = m.fileUrl ? adminFileUrl(m.fileUrl, m.deleted) : null;
+  if (m.deleted) div.classList.add('deleted');
+  if (m.kind === 'image' && fileUrl) {
     div.classList.add('media');
-    div.innerHTML = `<img class="msg-img" src="${m.fileUrl}" alt="صورة" loading="lazy" draggable="false">${meta}`;
-    div.querySelector('img').onclick = () => openImageViewer(m.fileUrl);
-  } else if (m.kind === 'video') {
+    div.innerHTML = `<img class="msg-img" src="${fileUrl}" alt="صورة" loading="lazy" draggable="false">${delTag}${meta}`;
+    div.querySelector('img').onclick = () => openImageViewer(fileUrl);
+  } else if (m.kind === 'video' && fileUrl) {
     div.classList.add('media');
-    div.innerHTML = `<video class="msg-video" src="${m.fileUrl}" controls preload="metadata" playsinline></video>${meta}`;
-  } else if (m.kind === 'voice') {
+    div.innerHTML = `<video class="msg-video" src="${fileUrl}" controls preload="metadata" playsinline></video>${delTag}${meta}`;
+  } else if (m.kind === 'voice' && fileUrl) {
     div.classList.add('media');
-    div.innerHTML = `<div class="voice-player"><button type="button" class="voice-play" title="تشغيل">▶</button><span class="voice-dur">${fmtCallDuration(m.durationSec || 0)}</span><audio src="${m.fileUrl}" preload="metadata"></audio></div>${meta}`;
+    div.innerHTML = `<div class="voice-player"><button type="button" class="voice-play" title="تشغيل">▶</button><span class="voice-dur">${fmtCallDuration(m.durationSec || 0)}</span><audio src="${fileUrl}" preload="metadata"></audio></div>${delTag}${meta}`;
     wireVoicePlayer(div, m);
+  } else if (m.text) {
+    div.innerHTML = `${escapeHtml(m.text)}${delTag}${meta}`;
   } else {
-    div.innerHTML = `${escapeHtml(m.text)}${meta}`;
+    // لا محتوى أصلياً محفوظاً (رسالة حُذفت قبل هذا التحديث مثلاً) — النص البديل فقط
+    div.innerHTML = `<span class="deleted-text">🚫 تم حذف هذه الرسالة</span>${delTag}${meta}`;
   }
   return div;
 }
