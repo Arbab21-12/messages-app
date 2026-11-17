@@ -4,14 +4,16 @@
  * اختيار وسيلة الإرسال (بالأولوية):
  *  أ) MAIL_OUTBOX مضبوط (اختبار/تطوير): تُلحق كل رسالة كسطر JSON
  *     {to, subject, text} في ذلك الملف وتُعدّ مُرسلة.
- *  ب) MAILJET_API_KEY + MAILJET_API_SECRET مضبوطان: إرسال عبر واجهة Mailjet
- *     البرمجية (HTTPS). المُرسِل: MAIL_FROM، أو SMTP_USER عند غيابه.
- *  ج) BREVO_API_KEY مضبوط: إرسال عبر واجهة Brevo البرمجية (HTTPS — المنفذ
- *     443 لا تحجبه بيئات الاستضافة التي تحجب منافذ SMTP الصادرة).
+ *  ب) SMTP2GO_API_KEY مضبوط: إرسال عبر واجهة SMTP2GO البرمجية (HTTPS —
+ *     المنفذ 443 لا تحجبه بيئات الاستضافة التي تحجب منافذ SMTP الصادرة).
  *     المُرسِل: MAIL_FROM، أو SMTP_USER عند غيابه.
- *  د) SMTP_USER + SMTP_PASS مضبوطان: إرسال SMTP حقيقي (Gmail افتراضياً) —
+ *  ج) MAILJET_API_KEY + MAILJET_API_SECRET مضبوطان: إرسال عبر واجهة Mailjet
+ *     البرمجية (HTTPS). المُرسِل: MAIL_FROM، أو SMTP_USER عند غيابه.
+ *  د) BREVO_API_KEY مضبوط: إرسال عبر واجهة Brevo البرمجية (HTTPS).
+ *     المُرسِل: MAIL_FROM، أو SMTP_USER عند غيابه.
+ *  هـ) SMTP_USER + SMTP_PASS مضبوطان: إرسال SMTP حقيقي (Gmail افتراضياً) —
  *     TLS ضمني على المنفذ 465، أو STARTTLS على 587 عند ضبط SMTP_PORT=587.
- *  هـ) غير ذلك: البريد معطّل — mailEnabled() ترجع false.
+ *  و) غير ذلك: البريد معطّل — mailEnabled() ترجع false.
  */
 const fs = require('fs');
 const net = require('net');
@@ -29,10 +31,12 @@ const BREVO_API_URL = process.env.BREVO_API_URL || 'https://api.brevo.com/v3/smt
 const MAILJET_API_KEY = process.env.MAILJET_API_KEY || '';
 const MAILJET_API_SECRET = process.env.MAILJET_API_SECRET || '';
 const MAILJET_API_URL = process.env.MAILJET_API_URL || 'https://api.mailjet.com/v3.1/send';
+const SMTP2GO_API_KEY = process.env.SMTP2GO_API_KEY || '';
+const SMTP2GO_API_URL = process.env.SMTP2GO_API_URL || 'https://api.smtp2go.com/v3/email/send';
 const MAIL_FROM = process.env.MAIL_FROM || '';
 
 function mailEnabled() {
-  return !!MAIL_OUTBOX || !!(MAILJET_API_KEY && MAILJET_API_SECRET) || !!BREVO_API_KEY || !!(SMTP_USER && SMTP_PASS);
+  return !!MAIL_OUTBOX || !!SMTP2GO_API_KEY || !!(MAILJET_API_KEY && MAILJET_API_SECRET) || !!BREVO_API_KEY || !!(SMTP_USER && SMTP_PASS);
 }
 
 // ---------- عميل SMTP مصغّر ----------
@@ -166,6 +170,70 @@ async function sendViaSmtp({ to, subject, text }) {
   }
 }
 
+// ---------- إرسال عبر واجهة SMTP2GO البرمجية (HTTPS) ----------
+// POST JSON إلى SMTP2GO_API_URL بترويسة X-Smtp2go-Api-Key. يُختار بروتوكول
+// الطلب من رابط الواجهة نفسه (https افتراضياً؛ http مسموح لاختبار وهمي محلي
+// فقط). النجاح: HTTP 200 و data.succeeded >= 1 في الردّ، بلا data.failed
+// وبلا حقل خطأ. لا يُسجَّل مفتاح API ولا نص الرسالة/الرمز في أي مكان.
+async function sendViaSmtp2go({ to, subject, text }) {
+  const from = MAIL_FROM || SMTP_USER;
+  if (!from) {
+    const err = new Error('بريد المُرسِل غير مضبوط: اضبط MAIL_FROM (أو SMTP_USER) لاستخدام SMTP2GO');
+    console.error('[mail] smtp2go failed:', err.message);
+    throw err;
+  }
+  const payload = JSON.stringify({
+    sender: from,
+    to: [to],
+    subject,
+    text_body: text,
+  });
+  const url = new URL(SMTP2GO_API_URL);
+  const lib = url.protocol === 'http:' ? http : https;
+  const { status, body } = await new Promise((resolve, reject) => {
+    const req = lib.request({
+      method: 'POST',
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'http:' ? 80 : 443),
+      path: url.pathname + url.search,
+      headers: {
+        'X-Smtp2go-Api-Key': SMTP2GO_API_KEY,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+      timeout: 15000,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.on('timeout', () => req.destroy(new Error('انتهت مهلة اتصال SMTP2GO')));
+    req.on('error', reject);
+    req.write(payload);
+    req.end();
+  });
+  // استخراج نتيجة الإرسال وملخص الخطأ من الردّ (حقول الخطأ لا أسرار فيها)
+  let succeeded = 0;
+  let failedCount = 0;
+  let errText = '';
+  try {
+    const parsed = JSON.parse(body || '{}');
+    const data = parsed.data || {};
+    if (typeof data.succeeded === 'number') succeeded = data.succeeded;
+    if (typeof data.failed === 'number') failedCount = data.failed;
+    const failMsgs = Array.isArray(data.failures)
+      ? data.failures.map((f) => (typeof f === 'string' ? f : f && (f.error || f.message))).filter(Boolean)
+      : [];
+    errText = failMsgs.join('; ') || data.error || parsed.error || '';
+    if (!errText && status !== 200) errText = parsed.message || '';
+  } catch {}
+  if (status === 200 && succeeded >= 1 && failedCount === 0 && !errText) return;
+  const detail = errText || (body || '').slice(0, 200);
+  console.error('[mail] smtp2go failed:', status, detail);
+  throw new Error(`فشل إرسال SMTP2GO: HTTP ${status}${detail ? ' — ' + detail : ''}`);
+}
+
 // ---------- إرسال عبر واجهة Mailjet البرمجية (HTTPS) ----------
 // POST JSON إلى MAILJET_API_URL بمصادقة Basic (مفتاح API + سرّه). يُختار
 // بروتوكول الطلب من رابط الواجهة نفسه (https افتراضياً؛ http مسموح لاختبار
@@ -289,11 +357,12 @@ async function sendMail({ to, subject, text }) {
     fs.appendFileSync(MAIL_OUTBOX, JSON.stringify({ to, subject, text }) + '\n', 'utf8');
     return;
   }
-  if (!(MAILJET_API_KEY && MAILJET_API_SECRET) && !BREVO_API_KEY && !(SMTP_USER && SMTP_PASS)) {
+  if (!SMTP2GO_API_KEY && !(MAILJET_API_KEY && MAILJET_API_SECRET) && !BREVO_API_KEY && !(SMTP_USER && SMTP_PASS)) {
     throw new Error('إرسال البريد غير مفعّل');
   }
   try {
-    if (MAILJET_API_KEY && MAILJET_API_SECRET) await sendViaMailjet({ to, subject, text });
+    if (SMTP2GO_API_KEY) await sendViaSmtp2go({ to, subject, text });
+    else if (MAILJET_API_KEY && MAILJET_API_SECRET) await sendViaMailjet({ to, subject, text });
     else if (BREVO_API_KEY) await sendViaBrevo({ to, subject, text });
     else await sendViaSmtp({ to, subject, text });
   } catch (err) {
