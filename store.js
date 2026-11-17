@@ -9,7 +9,9 @@
  *   listUsers, addMessage, getConversation, markConversationRead,
  *   markDelivered, getUndeliveredFor,
  *   getNameReservation, addNameReservation, removeNameReservation,
- *   listAllUsers, getAllMessages, listUploads
+ *   listAllUsers, getAllMessages, listUploads,
+ *   createEmailCode, getEmailCode, deleteEmailCode, bumpEmailCodeAttempts,
+ *   getEmailCodeLastSentAt, deleteSessionsForUser
  */
 const fs = require('fs');
 const path = require('path');
@@ -17,7 +19,7 @@ const path = require('path');
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'data.json');
 
-let db = { users: [], messages: [], sessions: {}, uploads: {}, nameReservations: [] };
+let db = { users: [], messages: [], sessions: {}, uploads: {}, nameReservations: [], emailCodes: [], emailCodeSentAt: {} };
 
 function load() {
   try {
@@ -29,9 +31,11 @@ function load() {
       sessions: parsed.sessions && typeof parsed.sessions === 'object' ? parsed.sessions : {},
       uploads: parsed.uploads && typeof parsed.uploads === 'object' ? parsed.uploads : {},
       nameReservations: Array.isArray(parsed.nameReservations) ? parsed.nameReservations : [],
+      emailCodes: Array.isArray(parsed.emailCodes) ? parsed.emailCodes : [],
+      emailCodeSentAt: parsed.emailCodeSentAt && typeof parsed.emailCodeSentAt === 'object' ? parsed.emailCodeSentAt : {},
     };
   } catch {
-    db = { users: [], messages: [], sessions: {}, uploads: {}, nameReservations: [] };
+    db = { users: [], messages: [], sessions: {}, uploads: {}, nameReservations: [], emailCodes: [], emailCodeSentAt: {} };
   }
 }
 
@@ -129,6 +133,54 @@ function deleteSession(token) {
     save();
   }
 }
+/** إلغاء جلسات مستخدم: كلّها، أو كلّها عدا رمز واحد (exceptToken) — يُستخدم بعد
+ *  تغيير كلمة المرور (تبقى جلسة المُغيِّر) وبعد استعادتها (تُلغى كل الجلسات). */
+function deleteSessionsForUser(userId, exceptToken) {
+  let changed = false;
+  for (const [token, uid] of Object.entries(db.sessions)) {
+    if (uid === userId && token !== exceptToken) {
+      delete db.sessions[token];
+      changed = true;
+    }
+  }
+  if (changed) save();
+}
+
+// ---------- رموز تأكيد البريد (ربط البريد / استعادة كلمة المرور) ----------
+// كل سجل: { userId, email, purpose: 'link'|'reset', codeHash, expiresAt, attempts, createdAt }
+// يُحفَظ تجزئة الرمز فقط (sha256) — الرمز نفسه لا يُخزَّن ولا يُسجَّل أبداً.
+// رمز فعّال واحد لكل (مستخدم، غرض): إنشاء رمز جديد يستبدل القديم فوراً.
+function emailCodeKey(userId, purpose) {
+  return userId + ':' + purpose;
+}
+function createEmailCode(rec) {
+  db.emailCodes = db.emailCodes.filter((c) => !(c.userId === rec.userId && c.purpose === rec.purpose));
+  db.emailCodes.push(rec);
+  db.emailCodeSentAt[emailCodeKey(rec.userId, rec.purpose)] = rec.createdAt;
+  save();
+  return rec;
+}
+function getEmailCode(userId, purpose) {
+  return db.emailCodes.find((c) => c.userId === userId && c.purpose === purpose) || null;
+}
+function deleteEmailCode(userId, purpose) {
+  const before = db.emailCodes.length;
+  db.emailCodes = db.emailCodes.filter((c) => !(c.userId === userId && c.purpose === purpose));
+  if (db.emailCodes.length !== before) save();
+}
+/** زيادة عدّاد المحاولات الخاطئة لرمز فعّال — ترجع السجل بعد الزيادة (أو null). */
+function bumpEmailCodeAttempts(userId, purpose) {
+  const rec = getEmailCode(userId, purpose);
+  if (!rec) return null;
+  rec.attempts = (rec.attempts || 0) + 1;
+  save();
+  return rec;
+}
+/** طابع آخر إرسال رمز لهذا (المستخدم، الغرض) — لفرض مهلة إعادة الإرسال (60 ثانية)
+ *  حتى بعد استهلاك الرمز أو استبداله. */
+function getEmailCodeLastSentAt(userId, purpose) {
+  return db.emailCodeSentAt[emailCodeKey(userId, purpose)] || 0;
+}
 
 // ---------- الرسائل ----------
 function addMessage(msg) {
@@ -199,6 +251,14 @@ function removeUpload(id) {
     save();
   }
 }
+/** تعليم ملف كمُحتجَز للمالك (retained): يُضبط عندما تُحذف رسالته لدى الجميع —
+ *  يبقى الملف على القرص لكن تقديمه يصبح مقيّداً بجلسة المالك فقط. */
+function markUploadRetained(id) {
+  if (db.uploads[id] && !db.uploads[id].retained) {
+    db.uploads[id].retained = true;
+    save();
+  }
+}
 
 module.exports = {
   DATA_DIR,
@@ -214,6 +274,12 @@ module.exports = {
   createSession,
   getUserIdByToken,
   deleteSession,
+  deleteSessionsForUser,
+  createEmailCode,
+  getEmailCode,
+  deleteEmailCode,
+  bumpEmailCodeAttempts,
+  getEmailCodeLastSentAt,
   addMessage,
   getConversation,
   getAllConversationsFor,
@@ -226,6 +292,7 @@ module.exports = {
   addUpload,
   getUpload,
   removeUpload,
+  markUploadRetained,
   listAllUsers,
   getAllMessages,
   listUploads,

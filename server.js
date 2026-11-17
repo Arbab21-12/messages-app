@@ -12,6 +12,7 @@ const crypto = require('crypto');
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const store = require('./store');
+const mailer = require('./mailer');
 
 const PORT = process.env.PORT || 3000;
 // اسم المستخدم: يبدأ بحرف أو رقم، ثم حروف/أرقام و _ . - — الطول الكلي 1–24
@@ -58,6 +59,16 @@ function publicUser(u) {
     isAdmin: !!ADMIN_USERNAME && u.username === ADMIN_USERNAME,
   };
 }
+/** مسلسِل «نفسي» لاستجابات المستخدم عن حسابه هو فقط (/api/me والتسجيل والدخول
+ *  وتعديلات الملف): يضيف حقول البريد الخاصة — لا تُعرض لأي مستخدم آخر أبداً. */
+function selfUser(u) {
+  return {
+    ...publicUser(u),
+    email: u.emailVerified && u.email ? u.email : null,
+    emailVerified: !!u.emailVerified,
+    pendingEmail: u.pendingEmail || null,
+  };
+}
 function publicMessage(m) {
   const from = store.getUserById(m.fromId);
   const to = store.getUserById(m.toId);
@@ -65,7 +76,9 @@ function publicMessage(m) {
     id: m.id,
     from: from ? from.username : null,
     to: to ? to.username : null,
-    text: m.text,
+    // المحذوفة لدى الجميع تُجرَّد من كل محتواها هنا (النص يُحتفَظ به في السجل
+    // للمالك وحده عبر adminMessage) — فلا يتسرب أي محتوى لأي عميل عادي
+    text: m.deleted ? '' : m.text,
     kind: m.kind || 'text',
     ts: m.ts,
     deliveredAt: m.deliveredAt || null,
@@ -105,12 +118,6 @@ function kindFromMime(mime) {
 function clampDuration(v) {
   const n = Number(v);
   return Number.isFinite(n) && n > 0 ? Math.min(Math.round(n), 86400) : 0;
-}
-function removeUploadFile(fileId) {
-  const meta = store.getUpload(fileId);
-  if (!meta) return;
-  try { fs.unlinkSync(path.join(UPLOADS_DIR, meta.file)); } catch {}
-  store.removeUpload(fileId);
 }
 function isHiddenFor(m, userId) {
   return Array.isArray(m.hiddenFor) && m.hiddenFor.includes(userId);
@@ -156,7 +163,7 @@ app.post('/api/register', (req, res) => {
   store.createUser(user);
   const token = newToken();
   store.createSession(token, user.id);
-  res.status(201).json({ token, user: publicUser(user) });
+  res.status(201).json({ token, user: selfUser(user) });
 });
 
 app.post('/api/login', (req, res) => {
@@ -167,7 +174,7 @@ app.post('/api/login', (req, res) => {
   }
   const token = newToken();
   store.createSession(token, user.id);
-  res.json({ token, user: publicUser(user) });
+  res.json({ token, user: selfUser(user) });
 });
 
 app.post('/api/logout', requireAuth, (req, res) => {
@@ -176,7 +183,7 @@ app.post('/api/logout', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/me', requireAuth, (req, res) => res.json({ user: publicUser(req.user) }));
+app.get('/api/me', requireAuth, (req, res) => res.json({ user: selfUser(req.user) }));
 
 // ---------- الملف الشخصي: الصورة وتغيير الاسم ----------
 // الصورة الشخصية: ملف صورة رفعه المستخدم نفسه عبر /api/upload — يُحفظ مرجعه على سجلّه.
@@ -190,7 +197,7 @@ app.post('/api/me/avatar', requireAuth, (req, res) => {
   }
   req.user.avatarFileId = fileId;
   store.saveUser();
-  res.json({ user: publicUser(req.user) });
+  res.json({ user: selfUser(req.user) });
 });
 
 // تغيير اسم المستخدم: نفس قواعد التسجيل (1–24، يبدأ بحرف/رقم، فرادة دقيقة لحالة الأحرف).
@@ -204,7 +211,7 @@ app.post('/api/me/username', requireAuth, (req, res) => {
   }
   const me = req.user;
   if (name === me.username) {
-    return res.json({ user: publicUser(me) }); // نفس الاسم الحالي — لا تغيير
+    return res.json({ user: selfUser(me) }); // نفس الاسم الحالي — لا تغيير
   }
   const existing = store.getUserByUsername(name);
   if (existing && existing.id !== me.id) {
@@ -214,7 +221,153 @@ app.post('/api/me/username', requireAuth, (req, res) => {
   store.saveUser();
   // إعادة بثّ الحضور بالأسماء الجديدة حتى تتحدث القوائم عند الجميع
   broadcastPresence();
-  res.json({ user: publicUser(me) });
+  res.json({ user: selfUser(me) });
+});
+
+// ---------- أمان الحساب: تغيير كلمة المرور + البريد المؤكد + الاستعادة ----------
+// رموز البريد: ٦ أرقام، تُخزَّن مجزّأة فقط (sha256 للرمز + معرّف المستخدم + الغرض)،
+// صلاحيتها ١٠ دقائق، وتُبطَل بعد ٥ محاولات خاطئة، وبين كل إرسالين لنفس الغرض
+// مهلة ٦٠ ثانية. الرمز نفسه لا يُخزَّن ولا يُسجَّل في أي مكان.
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const EMAIL_CODE_TTL_MS = 10 * 60 * 1000;
+const EMAIL_CODE_MAX_ATTEMPTS = 5;
+const EMAIL_CODE_COOLDOWN_MS = 60 * 1000;
+const MAIL_DISABLED_ERROR = 'إرسال البريد غير مفعّل بعد';
+
+function hashEmailCode(code, userId, purpose) {
+  return crypto.createHash('sha256').update(`${code}:${userId}:${purpose}`, 'utf8').digest('hex');
+}
+function newEmailCode() {
+  return String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+}
+/** إنشاء رمز جديد (يستبدل أي رمز فعّال لنفس الغرض) وإرساله بالبريد.
+ *  يرمي {status, error} عند مهلة إعادة الإرسال أو فشل الإرسال (ويحذف الرمز عندها). */
+async function issueEmailCode(user, email, purpose, subject) {
+  const last = store.getEmailCodeLastSentAt(user.id, purpose);
+  if (Date.now() - last < EMAIL_CODE_COOLDOWN_MS) {
+    throw { status: 429, error: 'طلبت رمزاً قبل قليل — انتظر دقيقة ثم حاول مجدداً' };
+  }
+  const code = newEmailCode();
+  store.createEmailCode({
+    userId: user.id,
+    email,
+    purpose,
+    codeHash: hashEmailCode(code, user.id, purpose),
+    expiresAt: Date.now() + EMAIL_CODE_TTL_MS,
+    attempts: 0,
+    createdAt: Date.now(),
+  });
+  try {
+    await mailer.sendMail({
+      to: email,
+      subject,
+      text: `رمزك في تطبيق «رسائلي» هو: ${code}\nالرمز صالح لمدة ١٠ دقائق فقط. إن لم تطلب هذا الرمز فتجاهل هذه الرسالة.`,
+    });
+  } catch {
+    store.deleteEmailCode(user.id, purpose);
+    throw { status: 502, error: 'تعذّر إرسال البريد الإلكتروني، حاول مرة أخرى لاحقاً' };
+  }
+}
+/** فحص رمز دون استهلاكه: { rec } عند الصحة، أو { status, error } عند الخطأ.
+ *  المحاولة الخاطئة تزيد العدّاد، وعند بلوغ الحد يُبطَل الرمز. الوضع generic
+ *  يوحّد رسائل الخطأ فلا تكشف سبب الفشل (مسار الاستعادة — منع التعداد). */
+function checkEmailCode(user, purpose, code, generic) {
+  const wrongMsg = generic ? 'الرمز غير صحيح أو منتهٍ' : 'الرمز غير صحيح';
+  const rec = store.getEmailCode(user.id, purpose);
+  if (!rec) return { status: 400, error: wrongMsg };
+  if (Date.now() > rec.expiresAt) {
+    store.deleteEmailCode(user.id, purpose);
+    return { status: 400, error: generic ? wrongMsg : 'انتهت صلاحية الرمز' };
+  }
+  const given = Buffer.from(hashEmailCode(String(code || ''), user.id, purpose), 'hex');
+  const expected = Buffer.from(rec.codeHash, 'hex');
+  const match = given.length === expected.length && crypto.timingSafeEqual(given, expected);
+  if (!match) {
+    const updated = store.bumpEmailCodeAttempts(user.id, purpose);
+    if (updated && updated.attempts >= EMAIL_CODE_MAX_ATTEMPTS) store.deleteEmailCode(user.id, purpose);
+    return { status: 400, error: wrongMsg };
+  }
+  return { rec };
+}
+
+// تغيير كلمة المرور: تحقق من الحالية، فرض قاعدة القوة على الجديدة، تحديث
+// التجزئة، وإلغاء كل جلسات المستخدم الأخرى (تبقى جلسة المُغيِّر صالحة).
+app.post('/api/me/password', requireAuth, (req, res) => {
+  const { currentPassword, newPassword } = req.body || {};
+  if (!currentPassword || !verifyPassword(String(currentPassword), req.user.salt, req.user.hash)) {
+    return res.status(401).json({ error: 'كلمة المرور الحالية غير صحيحة' });
+  }
+  const pwErr = passwordError(newPassword);
+  if (pwErr) return res.status(400).json({ error: pwErr });
+  const { salt, hash } = hashPassword(String(newPassword));
+  req.user.salt = salt;
+  req.user.hash = hash;
+  store.saveUser();
+  const myToken = (req.headers.authorization || '').slice(7);
+  store.deleteSessionsForUser(req.user.id, myToken);
+  res.json({ ok: true });
+});
+
+// ربط بريد إلكتروني بالحساب: يُحفَظ معلّقاً (pendingEmail) ويُرسَل إليه رمز
+// تأكيد — ولا يصبح «البريد المؤكد» إلا بعد إدخال الرمز الصحيح.
+app.post('/api/me/email', requireAuth, async (req, res) => {
+  const email = String((req.body || {}).email || '').trim().toLowerCase();
+  if (email.length > 254 || !EMAIL_RE.test(email)) {
+    return res.status(400).json({ error: 'صيغة البريد الإلكتروني غير صحيحة' });
+  }
+  if (!mailer.mailEnabled()) return res.status(503).json({ error: MAIL_DISABLED_ERROR });
+  try {
+    await issueEmailCode(req.user, email, 'link', 'رمز تأكيد البريد — رسائلي');
+  } catch (e) {
+    return res.status(e.status || 500).json({ error: e.error || 'حدث خطأ' });
+  }
+  req.user.pendingEmail = email;
+  store.saveUser();
+  res.json({ ok: true });
+});
+
+app.post('/api/me/email/verify', requireAuth, (req, res) => {
+  const user = req.user;
+  if (!user.pendingEmail) return res.status(400).json({ error: 'لا يوجد بريد بانتظار التأكيد' });
+  const result = checkEmailCode(user, 'link', (req.body || {}).code, false);
+  if (!result.rec) return res.status(result.status).json({ error: result.error });
+  user.email = user.pendingEmail;
+  user.emailVerified = true;
+  user.pendingEmail = null;
+  store.deleteEmailCode(user.id, 'link');
+  store.saveUser();
+  res.json({ ok: true, email: user.email });
+});
+
+// نسيت كلمة السر: الرد 200 دائماً (منع تعداد الحسابات) — يُرسَل رمز الاستعادة
+// فعلياً فقط إن وُجد الحساب وله بريد مؤكد، وأي فشل إرسال/مهلة يُبتلع بصمت.
+app.post('/api/password/forgot', async (req, res) => {
+  if (!mailer.mailEnabled()) return res.status(503).json({ error: MAIL_DISABLED_ERROR });
+  const username = String((req.body || {}).username || '').trim();
+  const user = username ? store.getUserByUsername(username) : null;
+  if (user && user.emailVerified && user.email) {
+    try { await issueEmailCode(user, user.email, 'reset', 'رمز استعادة كلمة السر — رسائلي'); } catch {}
+  }
+  res.json({ ok: true });
+});
+
+// تعيين كلمة سر جديدة برمز الاستعادة: بعد نجاحه تُحدَّث التجزئة وتُلغى كل
+// جلسات المستخدم ويُستهلك الرمز. كل أخطاء الرمز/المستخدم برسالة موحّدة.
+app.post('/api/password/reset', (req, res) => {
+  const { username, code, newPassword } = req.body || {};
+  const user = username ? store.getUserByUsername(String(username).trim()) : null;
+  if (!user) return res.status(400).json({ error: 'الرمز غير صحيح أو منتهٍ' });
+  const result = checkEmailCode(user, 'reset', code, true);
+  if (!result.rec) return res.status(result.status).json({ error: result.error });
+  const pwErr = passwordError(newPassword);
+  if (pwErr) return res.status(400).json({ error: pwErr });
+  const { salt, hash } = hashPassword(String(newPassword));
+  user.salt = salt;
+  user.hash = hash;
+  store.saveUser();
+  store.deleteEmailCode(user.id, 'reset');
+  store.deleteSessionsForUser(user.id, null);
+  res.json({ ok: true });
 });
 
 // ---------- دليل المستخدمين ----------
@@ -295,7 +448,10 @@ app.post('/api/messages/:username', requireAuth, (req, res) => {
 });
 
 // ---------- حذف رسالة ----------
-// scope=everyone: للمرسِل فقط — تتحول الرسالة إلى نص بديل (tombstone) ويُحذف ملفها إن وُجد.
+// scope=everyone: للمرسِل فقط — تختفي الرسالة عن الطرفين وتظهر كنص بديل (tombstone)،
+//   لكن محتواها الأصلي كاملاً (النص وملف الوسائط) يبقى محفوظاً للمالك وحده في لوحة
+//   البيانات: يُضبط deleted/deletedAt ويبقى سجل الرسالة وملفها كما هما، ويُعلَّم
+//   الملف كمُحتجَز (retained) فلا يُقدَّم بعدها إلا بجلسة المالك.
 // scope=me: لأي طرف — تُخفى عنه وحده (hiddenFor) وتبقى عند الطرف الآخر كما هي.
 app.delete('/api/messages/:id', requireAuth, (req, res) => {
   const msg = store.getMessageById(req.params.id);
@@ -309,15 +465,10 @@ app.delete('/api/messages/:id', requireAuth, (req, res) => {
       return res.status(403).json({ error: 'حذف الرسالة لدى الجميع متاح لمرسِلها فقط' });
     }
     if (!msg.deleted) {
-      const fileId = msg.fileId;
       msg.deleted = true;
-      msg.text = '';
-      delete msg.fileId;
-      delete msg.mime;
-      delete msg.size;
-      delete msg.durationSec;
+      msg.deletedAt = Date.now();
       store.saveMessage();
-      if (fileId) removeUploadFile(fileId);
+      if (msg.fileId) store.markUploadRetained(msg.fileId);
     }
   } else {
     if (!Array.isArray(msg.hiddenFor)) msg.hiddenFor = [];
@@ -368,6 +519,7 @@ function adminMessage(m) {
     deliveredAt: m.deliveredAt || null,
     readAt: m.readAt || null,
     deleted: !!m.deleted,
+    deletedAt: m.deletedAt || null,
     hiddenFor: (Array.isArray(m.hiddenFor) ? m.hiddenFor : []).map((id) => {
       const u = store.getUserById(id);
       return u ? u.username : id;
@@ -395,7 +547,7 @@ app.get('/api/admin/overview', requireAdmin, (req, res) => {
 
 app.get('/api/admin/users', requireAdmin, (req, res) => {
   const users = store.listAllUsers()
-    .map((u) => ({ username: u.username, avatar: store.avatarUrl(u), online: isUserOnline(u.id), createdAt: u.createdAt }))
+    .map((u) => ({ username: u.username, avatar: store.avatarUrl(u), online: isUserOnline(u.id), createdAt: u.createdAt, email: u.emailVerified && u.email ? u.email : null }))
     .sort((a, b) => a.username.localeCompare(b.username));
   res.json({ users });
 });
@@ -446,6 +598,7 @@ app.get('/api/admin/uploads', requireAdmin, (req, res) => {
         size: u.size,
         createdAt: u.ts || null,
         url: '/files/' + u.id,
+        retained: !!u.retained,
       };
     })
     .sort((x, y) => (y.createdAt || 0) - (x.createdAt || 0));
@@ -471,12 +624,29 @@ app.post('/api/upload', requireAuth, express.raw({ type: () => true, limit: '100
   res.status(201).json({ fileId: id, url: '/files/' + id, mime, size: buf.length });
 });
 
+// هل يحمل الطلب جلسة مالك صالحة؟ الرمز إما في ترويسة Authorization أو في
+// الاستعلام ?t= (حتى تستطيع لوحة البيانات تحميل الملف عبر <img>/<video>).
+// المطابقة دقيقة: اسم مستخدم الجلسة يجب أن يساوي ADMIN_USERNAME تماماً.
+function hasAdminToken(req) {
+  if (!ADMIN_USERNAME) return false;
+  const h = req.headers.authorization || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7) : (req.query.t ? String(req.query.t) : null);
+  if (!token) return false;
+  const userId = store.getUserIdByToken(token);
+  const user = userId ? store.getUserById(userId) : null;
+  return !!user && user.username === ADMIN_USERNAME;
+}
+
 // تقديم الملف الأصلي كما رُفع، مع دعم Range الأساسي لتشغيل الفيديو والتنقل فيه.
+// الملفات المُحتجَزة (رسالتها حُذفت لدى الجميع) لا تُقدَّم إلا للمالك — 404 لغيره.
 app.get('/files/:id', (req, res) => {
   const id = req.params.id;
   if (!/^[a-f0-9]{32}$/.test(id)) return res.status(404).json({ error: 'الملف غير موجود' });
   const meta = store.getUpload(id);
   if (!meta) return res.status(404).json({ error: 'الملف غير موجود' });
+  if (meta.retained && !hasAdminToken(req)) {
+    return res.status(404).json({ error: 'الملف غير موجود' });
+  }
   const filePath = path.join(UPLOADS_DIR, meta.file);
   fs.stat(filePath, (err, st) => {
     if (err) return res.status(404).json({ error: 'الملف غير موجود' });
