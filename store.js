@@ -15,7 +15,7 @@ const path = require('path');
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'data.json');
 
-let db = { users: [], messages: [], sessions: {} };
+let db = { users: [], messages: [], sessions: {}, uploads: {} };
 
 function load() {
   try {
@@ -25,9 +25,10 @@ function load() {
       users: Array.isArray(parsed.users) ? parsed.users : [],
       messages: Array.isArray(parsed.messages) ? parsed.messages : [],
       sessions: parsed.sessions && typeof parsed.sessions === 'object' ? parsed.sessions : {},
+      uploads: parsed.uploads && typeof parsed.uploads === 'object' ? parsed.uploads : {},
     };
   } catch {
-    db = { users: [], messages: [], sessions: {} };
+    db = { users: [], messages: [], sessions: {}, uploads: {} };
   }
 }
 
@@ -124,8 +125,31 @@ function markManyDelivered(messages) {
   for (const m of messages) if (!m.deliveredAt) m.deliveredAt = now;
   save();
 }
+function getMessageById(id) {
+  return db.messages.find((m) => m.id === id) || null;
+}
+/** حفظ أي تعديل أُجري على رسالة موجودة (حذف/إخفاء…) — الرسالة تُعدَّل في مكانها ثم تُستدعى هذه. */
+function saveMessage() {
+  save();
+}
+
+// ---------- الملفات المرفوعة (بيانات وصفية فقط — البايتات على القرص) ----------
+function addUpload(id, meta) {
+  db.uploads[id] = meta;
+  save();
+}
+function getUpload(id) {
+  return db.uploads[id] || null;
+}
+function removeUpload(id) {
+  if (db.uploads[id]) {
+    delete db.uploads[id];
+    save();
+  }
+}
 
 module.exports = {
+  DATA_DIR,
   getUserByUsername,
   getUserById,
   createUser,
@@ -140,4 +164,9 @@ module.exports = {
   markDelivered,
   getUndeliveredFor,
   markManyDelivered,
+  getMessageById,
+  saveMessage,
+  addUpload,
+  getUpload,
+  removeUpload,
 };

@@ -6,6 +6,7 @@
  *  - WebSocket تحت /ws (حضور + توصيل لحظي + إشعارات قراءة)
  */
 const http = require('http');
+const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
@@ -35,7 +36,7 @@ function publicUser(u) {
 function publicMessage(m) {
   const from = store.getUserById(m.fromId);
   const to = store.getUserById(m.toId);
-  return {
+  const out = {
     id: m.id,
     from: from ? from.username : null,
     to: to ? to.username : null,
@@ -44,7 +45,50 @@ function publicMessage(m) {
     ts: m.ts,
     deliveredAt: m.deliveredAt || null,
     readAt: m.readAt || null,
+    deleted: !!m.deleted,
   };
+  // حقول الوسائط تُعرض فقط ما دامت الرسالة غير محذوفة لدى الجميع
+  if (m.fileId && !m.deleted) {
+    out.fileId = m.fileId;
+    out.fileUrl = '/files/' + m.fileId;
+    out.mime = m.mime || null;
+    out.size = m.size || null;
+    out.durationSec = m.durationSec || null;
+  }
+  return out;
+}
+
+// ---------- الملفات المرفوعة ----------
+// تُحفظ البايتات الأصلية كما هي (دون أي إعادة ترميز أو ضغط) في DATA_DIR/uploads،
+// والبيانات الوصفية في مخزن JSON عبر store.addUpload.
+const UPLOADS_DIR = path.join(store.DATA_DIR, 'uploads');
+fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+const ALLOWED_UPLOAD_MIMES = {
+  'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp',
+  'image/gif': '.gif', 'image/heic': '.heic', 'image/heif': '.heif',
+  'video/mp4': '.mp4', 'video/webm': '.webm', 'video/quicktime': '.mov',
+  'audio/webm': '.webm', 'audio/mp4': '.m4a', 'audio/mpeg': '.mp3',
+  'audio/ogg': '.ogg', 'audio/wav': '.wav', 'audio/x-wav': '.wav', 'audio/aac': '.aac',
+};
+function kindFromMime(mime) {
+  if (!mime) return 'text';
+  if (mime.startsWith('image/')) return 'image';
+  if (mime.startsWith('video/')) return 'video';
+  if (mime.startsWith('audio/')) return 'voice';
+  return 'text';
+}
+function clampDuration(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.min(Math.round(n), 86400) : 0;
+}
+function removeUploadFile(fileId) {
+  const meta = store.getUpload(fileId);
+  if (!meta) return;
+  try { fs.unlinkSync(path.join(UPLOADS_DIR, meta.file)); } catch {}
+  store.removeUpload(fileId);
+}
+function isHiddenFor(m, userId) {
+  return Array.isArray(m.hiddenFor) && m.hiddenFor.includes(userId);
 }
 
 // ---------- Express ----------
@@ -115,14 +159,16 @@ app.get('/api/users', requireAuth, (req, res) => {
 
 // ---------- المحادثات والرسائل ----------
 app.get('/api/conversations', requireAuth, (req, res) => {
-  const mine = store.getAllConversationsFor(req.user.id);
+  // الرسائل المخفية لدى هذا المستخدم (حذف «لديّ») لا تظهر في القائمة ولا في المعاينة
+  const mine = store.getAllConversationsFor(req.user.id).filter((m) => !isHiddenFor(m, req.user.id));
   const byOther = new Map();
   for (const m of mine) {
     const otherId = m.fromId === req.user.id ? m.toId : m.fromId;
     if (!byOther.has(otherId)) byOther.set(otherId, { messages: [], unread: 0 });
     const entry = byOther.get(otherId);
     entry.messages.push(m);
-    if (m.toId === req.user.id && !m.readAt) entry.unread += 1;
+    // غير المقروء لا يحسب الرسائل المحذوفة لدى الجميع
+    if (m.toId === req.user.id && !m.readAt && !m.deleted) entry.unread += 1;
   }
   const conversations = [];
   for (const [otherId, entry] of byOther) {
@@ -143,7 +189,9 @@ app.get('/api/conversations', requireAuth, (req, res) => {
 app.get('/api/messages/:username', requireAuth, (req, res) => {
   const other = store.getUserByUsername(req.params.username);
   if (!other) return res.status(404).json({ error: 'المستخدم غير موجود' });
-  const messages = store.getConversation(req.user.id, other.id).map(publicMessage);
+  const messages = store.getConversation(req.user.id, other.id)
+    .filter((m) => !isHiddenFor(m, req.user.id))
+    .map(publicMessage);
   res.json({ with: other.username, messages });
 });
 
@@ -158,10 +206,127 @@ app.post('/api/messages/:username/read', requireAuth, (req, res) => {
 app.post('/api/messages/:username', requireAuth, (req, res) => {
   const other = store.getUserByUsername(req.params.username);
   if (!other) return res.status(404).json({ error: 'المستخدم غير موجود' });
-  const text = String((req.body || {}).text || '').trim();
+  const body = req.body || {};
+  // رسالة وسائط: تشير إلى ملف رُفع مسبقاً عبر /api/upload
+  if (body.fileId) {
+    const up = store.getUpload(String(body.fileId));
+    if (!up || up.ownerId !== req.user.id) return res.status(400).json({ error: 'ملف غير صالح' });
+    const kind = ['image', 'video', 'voice'].includes(body.kind) ? body.kind : kindFromMime(up.mime);
+    const msg = deliverMessage(req.user, other, { kind, fileId: String(body.fileId), durationSec: clampDuration(body.durationSec) });
+    return res.status(201).json({ message: publicMessage(msg) });
+  }
+  const text = String(body.text || '').trim();
   if (!text) return res.status(400).json({ error: 'الرسالة فارغة' });
-  const msg = deliverMessage(req.user, other, text);
+  const msg = deliverMessage(req.user, other, { text });
   res.status(201).json({ message: publicMessage(msg) });
+});
+
+// ---------- حذف رسالة ----------
+// scope=everyone: للمرسِل فقط — تتحول الرسالة إلى نص بديل (tombstone) ويُحذف ملفها إن وُجد.
+// scope=me: لأي طرف — تُخفى عنه وحده (hiddenFor) وتبقى عند الطرف الآخر كما هي.
+app.delete('/api/messages/:id', requireAuth, (req, res) => {
+  const msg = store.getMessageById(req.params.id);
+  if (!msg) return res.status(404).json({ error: 'الرسالة غير موجودة' });
+  if (msg.fromId !== req.user.id && msg.toId !== req.user.id) {
+    return res.status(403).json({ error: 'غير مسموح بحذف هذه الرسالة' });
+  }
+  const scope = (req.body || {}).scope === 'everyone' ? 'everyone' : 'me';
+  if (scope === 'everyone') {
+    if (msg.fromId !== req.user.id) {
+      return res.status(403).json({ error: 'حذف الرسالة لدى الجميع متاح لمرسِلها فقط' });
+    }
+    if (!msg.deleted) {
+      const fileId = msg.fileId;
+      msg.deleted = true;
+      msg.text = '';
+      delete msg.fileId;
+      delete msg.mime;
+      delete msg.size;
+      delete msg.durationSec;
+      store.saveMessage();
+      if (fileId) removeUploadFile(fileId);
+    }
+  } else {
+    if (!Array.isArray(msg.hiddenFor)) msg.hiddenFor = [];
+    if (!msg.hiddenFor.includes(req.user.id)) {
+      msg.hiddenFor.push(req.user.id);
+      store.saveMessage();
+    }
+  }
+  // بثّ للطرفين: المحادثات المفتوحة تُحدَّث لحظياً (العميل يطبّق «me» على صاحب الحذف فقط)
+  const evt = { type: 'message_deleted', id: msg.id, scope, by: req.user.username };
+  sendToUser(msg.fromId, evt);
+  if (msg.toId !== msg.fromId) sendToUser(msg.toId, evt);
+  res.json({ ok: true });
+});
+
+// ---------- رفع الملفات وتقديمها ----------
+// الجسم الخام كما هو (حتى 100MB) — تُحفظ البايتات الأصلية دون أي معالجة.
+app.post('/api/upload', requireAuth, express.raw({ type: () => true, limit: '100mb' }), (req, res) => {
+  const mime = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+  const ext = ALLOWED_UPLOAD_MIMES[mime];
+  if (!ext) return res.status(400).json({ error: 'نوع الملف غير مدعوم' });
+  const buf = Buffer.isBuffer(req.body) ? req.body : null;
+  if (!buf || !buf.length) return res.status(400).json({ error: 'الملف فارغ' });
+  const id = crypto.randomBytes(16).toString('hex'); // 32 hex chars
+  const fileName = id + ext;
+  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+  fs.writeFileSync(path.join(UPLOADS_DIR, fileName), buf);
+  const rawName = String(req.headers['x-file-name'] || '');
+  let name = rawName;
+  try { name = decodeURIComponent(rawName); } catch {}
+  store.addUpload(id, { file: fileName, mime, size: buf.length, name: name.slice(0, 200), ownerId: req.user.id, ts: Date.now() });
+  res.status(201).json({ fileId: id, url: '/files/' + id, mime, size: buf.length });
+});
+
+// تقديم الملف الأصلي كما رُفع، مع دعم Range الأساسي لتشغيل الفيديو والتنقل فيه.
+app.get('/files/:id', (req, res) => {
+  const id = req.params.id;
+  if (!/^[a-f0-9]{32}$/.test(id)) return res.status(404).json({ error: 'الملف غير موجود' });
+  const meta = store.getUpload(id);
+  if (!meta) return res.status(404).json({ error: 'الملف غير موجود' });
+  const filePath = path.join(UPLOADS_DIR, meta.file);
+  fs.stat(filePath, (err, st) => {
+    if (err) return res.status(404).json({ error: 'الملف غير موجود' });
+    const total = st.size;
+    res.setHeader('Content-Type', meta.mime);
+    res.setHeader('Accept-Ranges', 'bytes');
+    const range = req.headers.range;
+    if (range) {
+      const m = /^bytes=(\d*)-(\d*)$/.exec(String(range).trim());
+      if (m && (m[1] !== '' || m[2] !== '')) {
+        let start, end;
+        if (m[1] === '') { // لاحقة: آخر N بايت
+          start = Math.max(0, total - parseInt(m[2], 10));
+          end = total - 1;
+        } else {
+          start = parseInt(m[1], 10);
+          end = m[2] === '' ? total - 1 : Math.min(parseInt(m[2], 10), total - 1);
+        }
+        if (start > end || start >= total) {
+          res.setHeader('Content-Range', `bytes */${total}`);
+          return res.status(416).end();
+        }
+        res.status(206);
+        res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+        res.setHeader('Content-Length', end - start + 1);
+        return fs.createReadStream(filePath, { start, end }).pipe(res);
+      }
+    }
+    res.setHeader('Content-Length', total);
+    fs.createReadStream(filePath).pipe(res);
+  });
+});
+
+// أخطاء رفع الملفات تُرجع JSON عربياً بدل صفحة الخطأ الافتراضية
+app.use((err, req, res, next) => {
+  if (req.path === '/api/upload') {
+    const tooLarge = err && (err.type === 'entity.too.large' || err.status === 413);
+    return res.status(tooLarge ? 413 : (err.status || 500)).json({
+      error: tooLarge ? 'الملف أكبر من الحد الأقصى (100MB)' : 'فشل رفع الملف',
+    });
+  }
+  next(err);
 });
 
 // ---------- WebSocket ----------
@@ -194,17 +359,27 @@ function notifyReadReceipt(senderId, readerUsername, messageIds) {
   sendToUser(senderId, { type: 'read_receipt', with: readerUsername, messageIds });
 }
 
-/** إنشاء رسالة وحفظها وتوصيلها لحظياً إن كان المستقبِل متصلاً. */
-function deliverMessage(fromUser, toUser, text) {
+/** إنشاء رسالة وحفظها وتوصيلها لحظياً إن كان المستقبِل متصلاً.
+ *  payload: { text } لرسالة نصية، أو { kind, fileId, durationSec } لرسالة وسائط
+ *  (نوع الملف وحجمه يؤخذان من بيانات الرفع الوصفية — لا من العميل). */
+function deliverMessage(fromUser, toUser, payload) {
   const msg = {
     id: crypto.randomUUID(),
     fromId: fromUser.id,
     toId: toUser.id,
-    text,
+    text: payload.text || '',
     ts: Date.now(),
     deliveredAt: null,
     readAt: null,
   };
+  if (payload.kind && payload.kind !== 'text' && payload.fileId) {
+    msg.kind = payload.kind;
+    msg.fileId = payload.fileId;
+    const up = store.getUpload(payload.fileId);
+    if (up) { msg.mime = up.mime; msg.size = up.size; }
+    const dur = clampDuration(payload.durationSec);
+    if (dur) msg.durationSec = dur;
+  }
   store.addMessage(msg);
   const delivered = sendToUser(toUser.id, { type: 'message', message: publicMessage(msg) });
   if (delivered > 0) store.markDelivered(msg);
@@ -394,9 +569,18 @@ wss.on('connection', (ws) => {
 
     if (data.type === 'send') {
       const to = data.to ? store.getUserByUsername(String(data.to)) : null;
+      if (!to) { wsSend(ws, { type: 'error', error: 'رسالة غير صالحة' }); return; }
+      if (data.fileId) {
+        // رسالة وسائط: الملف يجب أن يكون مرفوعاً من هذا المستخدم نفسه
+        const up = store.getUpload(String(data.fileId));
+        if (!up || up.ownerId !== me.id) { wsSend(ws, { type: 'error', error: 'ملف غير صالح' }); return; }
+        const kind = ['image', 'video', 'voice'].includes(data.kind) ? data.kind : kindFromMime(up.mime);
+        deliverMessage(me, to, { kind, fileId: String(data.fileId), durationSec: clampDuration(data.durationSec) });
+        return;
+      }
       const text = String(data.text || '').trim();
-      if (!to || !text) { wsSend(ws, { type: 'error', error: 'رسالة غير صالحة' }); return; }
-      deliverMessage(me, to, text);
+      if (!text) { wsSend(ws, { type: 'error', error: 'رسالة غير صالحة' }); return; }
+      deliverMessage(me, to, { text });
     } else if (data.type === 'read') {
       const other = data.with ? store.getUserByUsername(String(data.with)) : null;
       if (!other) return;
