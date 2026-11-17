@@ -14,7 +14,21 @@ const { WebSocketServer } = require('ws');
 const store = require('./store');
 
 const PORT = process.env.PORT || 3000;
-const USERNAME_RE = /^[\p{L}\p{N}_.-]{3,32}$/u;
+// اسم المستخدم: يبدأ بحرف أو رقم، ثم حروف/أرقام و _ . - — الطول الكلي 3–24
+const USERNAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{2,23}$/;
+const USERNAME_ERROR = 'اسم المستخدم يجب أن يبدأ بحرف أو رقم، ويمكن أن يحتوي على حروف وأرقام و _ . - فقط';
+const USERNAME_TAKEN_ERROR = 'اسم المستخدم هذا مستخدم من قبل، اختر اسماً آخر';
+
+// قوة كلمة المرور (عند التسجيل فقط): 4 حروف على الأقل + رقم + رمز
+function passwordError(password) {
+  const pw = String(password || '');
+  const letters = (pw.match(/[A-Za-z]/g) || []).length;
+  const missing = [];
+  if (letters < 4) missing.push('٤ حروف على الأقل');
+  if (!/\d/.test(pw)) missing.push('رقم');
+  if (!/[^A-Za-z0-9]/.test(pw)) missing.push('رمز (مثل ! أو #)');
+  return missing.length ? 'كلمة المرور يجب أن تحتوي على: ' + missing.join(' + ') : null;
+}
 
 // ---------- أدوات التشفير والجلسات ----------
 function hashPassword(password) {
@@ -116,14 +130,15 @@ function requireAuth(req, res, next) {
 app.post('/api/register', (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !USERNAME_RE.test(String(username).trim())) {
-    return res.status(400).json({ error: 'اسم المستخدم يجب أن يكون 3 أحرف على الأقل (أحرف وأرقام و _ . -)' });
+    return res.status(400).json({ error: USERNAME_ERROR });
   }
-  if (!password || String(password).length < 4) {
-    return res.status(400).json({ error: 'كلمة المرور يجب أن تكون 4 أحرف على الأقل' });
+  const pwErr = passwordError(password);
+  if (pwErr) {
+    return res.status(400).json({ error: pwErr });
   }
   const name = String(username).trim();
   if (store.getUserByUsername(name)) {
-    return res.status(409).json({ error: 'اسم المستخدم مستخدم من قبل' });
+    return res.status(409).json({ error: USERNAME_TAKEN_ERROR });
   }
   const { salt, hash } = hashPassword(String(password));
   const user = { id: crypto.randomUUID(), username: name, salt, hash, createdAt: Date.now() };
