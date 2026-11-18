@@ -26,7 +26,13 @@
 // /api/admin/users/:username/files (الفئات منفصلة، الصورة الشخصية ليست في
 // الصور، الملف المُحتجَز المحذوف لدى الجميع داخل العدّادات، ورفض غير المالك)،
 // والتصنيف الاحتياطي للسجلات القديمة بلا kind على خادم سابع ببيانات مزروعة
-// (ملف الصورة الشخصية الحالية يُعدّ صورةً شخصية وما عداه بنوع mime).
+// (ملف الصورة الشخصية الحالية يُعدّ صورةً شخصية وما عداه بنوع mime)، ونظام
+// الصداقة والبحث عن الأشخاص (v1.9.0): البحث بالاسم مع حالة العلاقة، استبعاد
+// حساب المالك من بحث العاديين وظهور الجميع عند المالك، دورة الطلب كاملة
+// (إرسال/تكرار/تلميح pending_in/رفض/إعادة/قبول/إلغاء/إلغاء صداقة)، بوابة بدء
+// المحادثات الجديدة (REST وWebSocket والمكالمات) مع بقاء المحادثات القائمة
+// مفتوحة دائماً، تجاوز المالك الكامل، وتقييد دليل /api/users للعاديين
+// (أصدقاء وشركاء محادثات فقط)، والتقاط Push لطلب صداقة على الخادم السادس.
 // التشغيل: npm test
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -142,9 +148,50 @@ try {
   check('دخول omar_test بكلمة المرور الصحيحة', loginA.status === 200 && !!loginA.data.token);
   const tokA = loginA.data.token, tokB = regB.data.token;
 
-  // 3) البحث في الدليل
-  const dir = await api('/api/users?q=sara', { token: tokA });
-  check('البحث يجد sara_test ولا يعرض النفس', dir.data.users?.some((u) => u.username === 'sara_test') && !dir.data.users?.some((u) => u.username === 'omar_test'));
+  // 3) البحث عن الأشخاص + نظام الصداقة: omar و sara يتصادقان هنا — وبقية
+  // أقسام الاختبار تعتمد على صداقتهما/محادثتهما لعبور بوابة المحادثات الجديدة.
+  const searchSara = await api('/api/users/search?q=sara', { token: tokA });
+  check('البحث بالاسم يجد sara_test بحالة علاقة none ولا يعرض النفس',
+    searchSara.data.users?.some((u) => u.username === 'sara_test' && u.relation === 'none') &&
+    !searchSara.data.users?.some((u) => u.username === 'omar_test'),
+    JSON.stringify(searchSara.data.users || {}));
+  const dirRestricted = await api('/api/users?q=sara', { token: tokA });
+  check('الدليل للمستخدم العادي لا يعدّد الغرباء (sara غائبة قبل الصداقة/المحادثة)',
+    !dirRestricted.data.users?.some((u) => u.username === 'sara_test'));
+  const gatedMsg = await api('/api/messages/sara_test', { method: 'POST', token: tokA, body: { text: 'رسالة قبل الصداقة' } });
+  check('أول رسالة لغريب تُرفض 403 برسالة «أرسل طلب صداقة أولاً»',
+    gatedMsg.status === 403 && (gatedMsg.data.error || '').includes('طلب صداقة أولاً'),
+    `status=${gatedMsg.status} err=${gatedMsg.data.error || ''}`);
+  const frReqOS = await api('/api/friends/request', { method: 'POST', token: tokA, body: { username: 'sara_test' } });
+  check('omar يرسل طلب صداقة إلى sara (201)', frReqOS.status === 201 && frReqOS.data.ok === true,
+    `status=${frReqOS.status} err=${frReqOS.data.error || ''}`);
+  const frDupOS = await api('/api/friends/request', { method: 'POST', token: tokA, body: { username: 'sara_test' } });
+  check('طلب صداقة مكرر وهو معلّق يُرفض 400', frDupOS.status === 400, `status=${frDupOS.status}`);
+  const searchOutOS = await api('/api/users/search?q=sara', { token: tokA });
+  check('البحث عند omar بعد الإرسال يعرض العلاقة pending_out',
+    searchOutOS.data.users?.find((u) => u.username === 'sara_test')?.relation === 'pending_out');
+  const searchInOS = await api('/api/users/search?q=omar', { token: tokB });
+  check('البحث عند sara يعرض العلاقة pending_in',
+    searchInOS.data.users?.find((u) => u.username === 'omar_test')?.relation === 'pending_in');
+  const reqsSara = await api('/api/friends/requests', { token: tokB });
+  const incOS = reqsSara.data.incoming?.find((r) => r.from?.username === 'omar_test');
+  check('sara ترى طلب omar في الطلبات الواردة (مع صورته)', !!incOS && 'avatarUrl' in (incOS.from || {}));
+  const outOmar = await api('/api/friends/requests', { token: tokA });
+  check('omar يرى طلبه في الصادرة إلى sara',
+    outOmar.data.outgoing?.some((r) => r.to?.username === 'sara_test'));
+  const frAccOS = await api('/api/friends/accept', { method: 'POST', token: tokB, body: { requestId: incOS?.id } });
+  check('sara تقبل طلب صداقة omar (200)', frAccOS.status === 200 && frAccOS.data.ok === true, `status=${frAccOS.status}`);
+  const friendsOmar = await api('/api/friends', { token: tokA });
+  const friendsSara = await api('/api/friends', { token: tokB });
+  check('بعد القبول: كل طرف في قائمة أصدقاء الآخر',
+    friendsOmar.data.friends?.some((f) => f.username === 'sara_test') &&
+    friendsSara.data.friends?.some((f) => f.username === 'omar_test'));
+  const searchFriendsOS = await api('/api/users/search?q=sara', { token: tokA });
+  check('البحث بعد القبول يعرض العلاقة friends',
+    searchFriendsOS.data.users?.find((u) => u.username === 'sara_test')?.relation === 'friends');
+  const dirAfterFriend = await api('/api/users?q=sara', { token: tokA });
+  check('الدليل بعد الصداقة يعرض sara (صديقة الآن)',
+    dirAfterFriend.data.users?.some((u) => u.username === 'sara_test'));
 
   // 4) اتصال WebSocket للطرفين + الحضور
   const A = await connectWs(tokA);
@@ -245,6 +292,13 @@ try {
   // مسار عدم الاتصال: مستخدم مسجّل لكنه غير متصل → call_unavailable + سجل «فائتة»
   const regC = await api('/api/register', { method: 'POST', body: { username: 'carol_test', password: 'Pass9999!' } });
   check('تسجيل carol_test (غير متصلة)', regC.status === 201);
+  // بوابة المكالمات: A و carol يتصادقان أولاً (وإلا حُظرت الدعوة كغريب)
+  const frCarol = await api('/api/friends/request', { method: 'POST', token: tokA, body: { username: 'carol_test' } });
+  const reqsCarol = await api('/api/friends/requests', { token: regC.data.token });
+  const incCarol = reqsCarol.data.incoming?.find((r) => r.from?.username === 'omar_test');
+  const accCarol = await api('/api/friends/accept', { method: 'POST', token: regC.data.token, body: { requestId: incCarol?.id } });
+  check('carol تقبل صداقة A قبل اختبار الاتصال بها', frCarol.status === 201 && accCarol.status === 200,
+    `req=${frCarol.status} acc=${accCarol.status}`);
   A.send({ type: 'call_invite', to: 'carol_test', callType: 'voice' });
   const unavail = await A.waitFor((m) => m.type === 'call_unavailable' && m.with === 'carol_test').catch(() => null);
   check('A يستلم call_unavailable عند الاتصال بمستخدم غير متصل', !!unavail);
@@ -431,7 +485,11 @@ try {
   check('/api/me للمالك: isAdmin=true', meAdmin.data.user?.isAdmin === true, JSON.stringify(meAdmin.data.user || {}));
   const adminForbidden = await api('/api/admin/overview', { token: tokPlain });
   check('نقاط الإدارة محرّمة على غير المالك (403)', adminForbidden.status === 403, `status=${adminForbidden.status}`);
-  // زرع محادثة بين العادي والمالك: رسالة نصية + رسالة صورة
+  // زرع محادثة بين العادي والمالك: المالك يبدأها (تجاوز البوابة — مراسلة أي
+  // شخص كما هو دائماً)، ثم رسائل plain_user استمرارٌ لمحادثة قائمة فلا تُحظر.
+  const adminFirst = await api('/api/messages/plain_user', { method: 'POST', token: tokAdmin, body: { text: 'رسالة المالك الأولى' } });
+  check('المالك يبدأ محادثة مع plain_user (تجاوز بوابة الصداقة)', adminFirst.status === 201,
+    `status=${adminFirst.status} err=${adminFirst.data.error || ''}`);
   const plainText = await api('/api/messages/admin_test', { method: 'POST', token: tokPlain, body: { text: 'رسالة للوحة البيانات' } });
   check('plain_user يرسل رسالة نصية إلى admin_test', plainText.status === 201, `status=${plainText.status}`);
   const upAdminImg = await uploadRaw(PNG_BYTES, { token: tokPlain, mime: 'image/png', name: 'admin-pixel.png' });
@@ -472,6 +530,13 @@ try {
   check('تسجيل ret_a و ret_b (اختبار الاحتجاز)', regRetA.status === 201 && regRetB.status === 201,
     `a=${regRetA.status} b=${regRetB.status}`);
   const tokRetA = regRetA.data.token, tokRetB = regRetB.data.token;
+  // بوابة الصداقة: يتصادقان أولاً حتى تمرّ رسائل الاحتجاز بينهما
+  const frRet = await api('/api/friends/request', { method: 'POST', token: tokRetA, body: { username: 'ret_b' } });
+  const reqsRet = await api('/api/friends/requests', { token: tokRetB });
+  const incRet = reqsRet.data.incoming?.find((r) => r.from?.username === 'ret_a');
+  const accRet = await api('/api/friends/accept', { method: 'POST', token: tokRetB, body: { requestId: incRet?.id } });
+  check('ret_a و ret_b يتصادقان قبل رسائل الاحتجاز', frRet.status === 201 && accRet.status === 200,
+    `req=${frRet.status} acc=${accRet.status}`);
   const upRet = await uploadRaw(PNG_BYTES, { token: tokRetA, mime: 'image/png', name: 'retained.png' });
   check('ret_a يرفع صورة لرسالة الاحتجاز', upRet.status === 201 && !!upRet.data.fileId, `status=${upRet.status}`);
   const retFileUrl = '/files/' + upRet.data.fileId;
@@ -540,6 +605,14 @@ try {
   check('تسجيل fold_user و fold_peer (اختبار المجلدات)', regFold.status === 201 && regFoldPeer.status === 201,
     `user=${regFold.status} peer=${regFoldPeer.status}`);
   const tokFold = regFold.data.token;
+  const tokFoldPeer = regFoldPeer.data.token;
+  // بوابة الصداقة: يتصادقان أولاً حتى تمرّ رسائل اختبار المجلدات بينهما
+  const frFold = await api('/api/friends/request', { method: 'POST', token: tokFold, body: { username: 'fold_peer' } });
+  const reqsFold = await api('/api/friends/requests', { token: tokFoldPeer });
+  const incFold = reqsFold.data.incoming?.find((r) => r.from?.username === 'fold_user');
+  const accFold = await api('/api/friends/accept', { method: 'POST', token: tokFoldPeer, body: { requestId: incFold?.id } });
+  check('fold_user و fold_peer يتصادقان قبل رسائل المجلدات', frFold.status === 201 && accFold.status === 200,
+    `req=${frFold.status} acc=${accFold.status}`);
   const MP4_BYTES = Buffer.from('FAKE_MP4_VIDEO_BYTES');
   const VOICE_BYTES = Buffer.from('FAKE_WEBM_AUDIO_BYTES');
   const fUpPhoto = await uploadRaw(PNG_BYTES, { token: tokFold, mime: 'image/png', name: 'fold-photo.png' });
@@ -681,6 +754,145 @@ try {
     server7.kill();
     fs.rmSync(dataDir7, { recursive: true, force: true });
   }
+
+  // 24) نظام الصداقة والبحث وبوابة المحادثات — تدفق كامل على الخادم الرئيسي:
+  // استبعاد المالك من بحث العاديين، رفض طلبات المالك/النفس/الشبح، تجاوز
+  // المالك، حظر رسائل/مكالمات الغرباء، ودورة الطلب (تلميح pending_in، رفض ثم
+  // إعادة، قبول من المستقبِل فقط، إلغاء من المرسِل فقط، إلغاء صداقة مع بقاء
+  // المحادثة صالحة).
+  const regFrA = await api('/api/register', { method: 'POST', body: { username: 'fr_a', password: 'Friend123!' } });
+  const regFrB = await api('/api/register', { method: 'POST', body: { username: 'fr_b', password: 'Friend123!' } });
+  const regFrC = await api('/api/register', { method: 'POST', body: { username: 'fr_c', password: 'Friend123!' } });
+  check('تسجيل fr_a و fr_b و fr_c', [regFrA, regFrB, regFrC].every((r) => r.status === 201),
+    `a=${regFrA.status} b=${regFrB.status} c=${regFrC.status}`);
+  const tokFrA = regFrA.data.token, tokFrB = regFrB.data.token, tokFrC = regFrC.data.token;
+
+  // البحث: العادي لا يرى المالك أبداً — المالك يرى الجميع — والفارغ بلا نتائج
+  const searchAdminByFr = await api('/api/users/search?q=admin', { token: tokFrA });
+  check('بحث المستخدم العادي لا يعرض حساب المالك أبداً',
+    !(searchAdminByFr.data.users || []).some((u) => u.username === 'admin_test'),
+    JSON.stringify(searchAdminByFr.data.users || {}));
+  const searchByAdmin = await api('/api/users/search?q=fr_', { token: tokAdmin });
+  check('بحث المالك يعرض الجميع (fr_a و fr_b و fr_c)',
+    ['fr_a', 'fr_b', 'fr_c'].every((n) => searchByAdmin.data.users?.some((u) => u.username === n)),
+    JSON.stringify(searchByAdmin.data.users || {}));
+  const searchEmptyQ = await api('/api/users/search?q=', { token: tokFrA });
+  check('بحث بنص فارغ يرجع قائمة فارغة (اكتشاف بالبحث فقط، لا تعداد)',
+    searchEmptyQ.status === 200 && (searchEmptyQ.data.users || []).length === 0, `status=${searchEmptyQ.status}`);
+  const profAdminByFr = await api('/api/users/fr_a', { token: tokAdmin });
+  check('ملف مستخدم عند المالك: relation=none دائماً', profAdminByFr.data.relation === 'none',
+    JSON.stringify(profAdminByFr.data || {}));
+  const profOfAdmin = await api('/api/users/admin_test', { token: tokFrA });
+  check('ملف المالك عند العادي: isAdmin=true (لإخفاء أزرار الصداقة)', profOfAdmin.data.isAdmin === true,
+    JSON.stringify(profOfAdmin.data || {}));
+
+  // طلبات ممنوعة: إلى المالك، ومن المالك، وللنفس، ولمستخدم غير موجود
+  const reqToAdmin = await api('/api/friends/request', { method: 'POST', token: tokFrA, body: { username: 'admin_test' } });
+  check('طلب صداقة إلى المالك يُرفض 400 «غير متاح لطلبات الصداقة»',
+    reqToAdmin.status === 400 && (reqToAdmin.data.error || '').includes('غير متاح لطلبات الصداقة'),
+    `status=${reqToAdmin.status} err=${reqToAdmin.data.error || ''}`);
+  const reqByAdmin = await api('/api/friends/request', { method: 'POST', token: tokAdmin, body: { username: 'fr_a' } });
+  check('المالك نفسه يُرفض من نقطة إرسال طلبات الصداقة (403)', reqByAdmin.status === 403, `status=${reqByAdmin.status}`);
+  const reqSelf = await api('/api/friends/request', { method: 'POST', token: tokFrA, body: { username: 'fr_a' } });
+  check('طلب صداقة للنفس يُرفض 400', reqSelf.status === 400, `status=${reqSelf.status}`);
+  const reqGhost = await api('/api/friends/request', { method: 'POST', token: tokFrA, body: { username: 'ghost_fr' } });
+  check('طلب صداقة لمستخدم غير موجود يُرفض 404', reqGhost.status === 404, `status=${reqGhost.status}`);
+
+  // تجاوز المالك: أول رسالة منه لمستخدم جديد تنجح، وردّ المستخدم استمرارية
+  const adminToC = await api('/api/messages/fr_c', { method: 'POST', token: tokAdmin, body: { text: 'رسالة المالك الأولى لمستخدم جديد' } });
+  check('أول رسالة من المالك إلى مستخدم جديد تماماً تنجح (تجاوز البوابة)',
+    adminToC.status === 201, `status=${adminToC.status} err=${adminToC.data.error || ''}`);
+  const cReplyAdmin = await api('/api/messages/admin_test', { method: 'POST', token: tokFrC, body: { text: 'رد على المالك' } });
+  check('ردّ المستخدم على المالك داخل محادثة قائمة (بلا أي صداقة) يعمل',
+    cReplyAdmin.status === 201, `status=${cReplyAdmin.status} err=${cReplyAdmin.data.error || ''}`);
+
+  // بوابة WebSocket: رسالة غريب لا تصل ولا تُحفظ، والمرسل يستلم الخطأ بالعربية
+  const FrA = await connectWs(tokFrA);
+  const FrB = await connectWs(tokFrB);
+  await wait(200);
+  FrA.send({ type: 'send', to: 'fr_b', text: 'رسالة غريب عبر WS' });
+  const wsGateErr = await FrA.waitFor((m) => m.type === 'error' && (m.error || '').includes('طلب صداقة أولاً')).catch(() => null);
+  check('WS: مرسِل الرسالة المحظورة يستلم خطأ البوابة بالعربية', !!wsGateErr);
+  await wait(400);
+  check('WS: الغريب لم يستلم أي رسالة محظورة', !FrB.inbox.some((m) => m.type === 'message' && (m.message?.text || '').includes('رسالة غريب')));
+  const histGateB = await api('/api/messages/fr_a', { token: tokFrB });
+  check('الرسالة المحظورة غير محفوظة في السجل أصلاً',
+    !(histGateB.data.messages || []).some((m) => (m.text || '').includes('رسالة غريب')));
+
+  // دورة الطلب: إرسال (حدث لحظي) → تلميح pending_in عكسياً → رفض → إعادة → قبول
+  const reqAB = await api('/api/friends/request', { method: 'POST', token: tokFrA, body: { username: 'fr_b' } });
+  check('fr_a يطلب صداقة fr_b (201)', reqAB.status === 201, `status=${reqAB.status} err=${reqAB.data.error || ''}`);
+  const frEvent = await FrB.waitFor((m) => m.type === 'friend_request' && m.from?.username === 'fr_a').catch(() => null);
+  check('fr_b المتصل يستلم حدث friend_request لحظياً مع اسم المرسل', !!frEvent);
+  const reqBA = await api('/api/friends/request', { method: 'POST', token: tokFrB, body: { username: 'fr_a' } });
+  check('طلب عكسي أثناء التعليق يُرفض 400 مع code=pending_in',
+    reqBA.status === 400 && reqBA.data.code === 'pending_in',
+    `status=${reqBA.status} code=${reqBA.data.code || ''} err=${reqBA.data.error || ''}`);
+  const reqsFrB1 = await api('/api/friends/requests', { token: tokFrB });
+  const incAB1 = reqsFrB1.data.incoming?.find((r) => r.from?.username === 'fr_a');
+  const rejBySender = await api('/api/friends/reject', { method: 'POST', token: tokFrA, body: { requestId: incAB1?.id } });
+  check('رفض الطلب من غير مستقبِله يُرفض 403', rejBySender.status === 403, `status=${rejBySender.status}`);
+  const rejAB = await api('/api/friends/reject', { method: 'POST', token: tokFrB, body: { requestId: incAB1?.id } });
+  check('fr_b يرفض طلب fr_a (200)', rejAB.status === 200, `status=${rejAB.status}`);
+  const reqsFrB2 = await api('/api/friends/requests', { token: tokFrB });
+  check('بعد الرفض: لا طلبات واردة متبقية عند fr_b', (reqsFrB2.data.incoming || []).length === 0);
+  const reqAB2 = await api('/api/friends/request', { method: 'POST', token: tokFrA, body: { username: 'fr_b' } });
+  check('بعد الرفض يمكن إعادة إرسال الطلب من جديد (201)', reqAB2.status === 201, `status=${reqAB2.status}`);
+  const reqsFrB3 = await api('/api/friends/requests', { token: tokFrB });
+  const incAB2 = reqsFrB3.data.incoming?.find((r) => r.from?.username === 'fr_a');
+  const accBySender = await api('/api/friends/accept', { method: 'POST', token: tokFrA, body: { requestId: incAB2?.id } });
+  check('قبول الطلب من غير مستقبِله يُرفض 403', accBySender.status === 403, `status=${accBySender.status}`);
+  const accAB = await api('/api/friends/accept', { method: 'POST', token: tokFrB, body: { requestId: incAB2?.id } });
+  check('fr_b يقبل طلب fr_a (200)', accAB.status === 200, `status=${accAB.status}`);
+  const accEvent = await FrA.waitFor((m) => m.type === 'friend_accepted' && m.from?.username === 'fr_b').catch(() => null);
+  check('fr_a المتصل يستلم حدث friend_accepted لحظياً', !!accEvent);
+  const firstMsgAB = await api('/api/messages/fr_b', { method: 'POST', token: tokFrA, body: { text: 'أول رسالة بعد الصداقة' } });
+  check('بعد قبول الصداقة: أول رسالة بين fr_a و fr_b تنجح',
+    firstMsgAB.status === 201, `status=${firstMsgAB.status} err=${firstMsgAB.data.error || ''}`);
+  const reqAlreadyFriends = await api('/api/friends/request', { method: 'POST', token: tokFrA, body: { username: 'fr_b' } });
+  check('طلب صداقة لصديق قائم يُرفض 400', reqAlreadyFriends.status === 400, `status=${reqAlreadyFriends.status}`);
+
+  // الإلغاء: مرسِل الطلب وحده يلغيه
+  const reqAC = await api('/api/friends/request', { method: 'POST', token: tokFrA, body: { username: 'fr_c' } });
+  check('fr_a يطلب صداقة fr_c (201)', reqAC.status === 201, `status=${reqAC.status}`);
+  const outFrA = await api('/api/friends/requests', { token: tokFrA });
+  const outReqAC = outFrA.data.outgoing?.find((r) => r.to?.username === 'fr_c');
+  check('طلب fr_c ظاهر في قائمة الصادرة عند fr_a', !!outReqAC);
+  const cancelByOther = await api('/api/friends/cancel', { method: 'POST', token: tokFrC, body: { requestId: outReqAC?.id } });
+  check('إلغاء الطلب من غير مرسِله يُرفض 403', cancelByOther.status === 403, `status=${cancelByOther.status}`);
+  const cancelAC = await api('/api/friends/cancel', { method: 'POST', token: tokFrA, body: { requestId: outReqAC?.id } });
+  check('fr_a يلغي طلبه الصادر بنفسه (200)', cancelAC.status === 200, `status=${cancelAC.status}`);
+  const reqsFrCAfter = await api('/api/friends/requests', { token: tokFrC });
+  check('بعد الإلغاء: لا طلب وارد من fr_a عند fr_c',
+    !(reqsFrCAfter.data.incoming || []).some((r) => r.from?.username === 'fr_a'));
+
+  // بوابة المكالمات: fr_a يتصل بـ fr_c (لا صداقة ولا محادثة بينهما)
+  const FrC = await connectWs(tokFrC);
+  await wait(200);
+  FrA.send({ type: 'call_invite', to: 'fr_c', callType: 'voice' });
+  const callGate = await FrA.waitFor((m) => m.type === 'call_error' && (m.error || '').includes('قبل قبول طلب الصداقة')).catch(() => null);
+  check('بوابة المكالمات: المتصل بالغريب يستلم call_error بالعربية', !!callGate,
+    JSON.stringify(FrA.inbox.slice(-3)));
+  await wait(500);
+  check('بوابة المكالمات: المدعو الغريب لم يستلم أي دعوة مكالمة', !FrC.inbox.some((m) => m.type === 'call_invite'));
+  const histGateAC = await api('/api/messages/fr_c', { token: tokFrA });
+  check('بوابة المكالمات: لا سجل مكالمة محفوظ عن الدعوة المحظورة',
+    !(histGateAC.data.messages || []).some((m) => m.kind === 'call'));
+  FrC.close();
+
+  // إلغاء الصداقة: الصداقة تُحذف والمحادثة القائمة تبقى صالحة للرسائل
+  const unfriendAB = await api('/api/friends/remove', { method: 'POST', token: tokFrA, body: { username: 'fr_b' } });
+  check('fr_a يلغي صداقة fr_b (200)', unfriendAB.status === 200, `status=${unfriendAB.status}`);
+  const friendsFrBAfter = await api('/api/friends', { token: tokFrB });
+  check('بعد إلغاء الصداقة: fr_a لم يعد في قائمة أصدقاء fr_b',
+    !(friendsFrBAfter.data.friends || []).some((f) => f.username === 'fr_a'));
+  const msgAfterUnfriend = await api('/api/messages/fr_b', { method: 'POST', token: tokFrA, body: { text: 'رسالة بعد إلغاء الصداقة داخل محادثة قائمة' } });
+  check('بعد إلغاء الصداقة: الرسائل داخل المحادثة القائمة ما زالت تعمل',
+    msgAfterUnfriend.status === 201, `status=${msgAfterUnfriend.status} err=${msgAfterUnfriend.data.error || ''}`);
+  const unfriendAgain = await api('/api/friends/remove', { method: 'POST', token: tokFrA, body: { username: 'fr_b' } });
+  check('إلغاء صداقة غير قائمة يُرفض 400', unfriendAgain.status === 400, `status=${unfriendAgain.status}`);
+  FrA.close();
+  FrB.close();
 
   // 17) أمان الحساب: تغيير كلمة المرور + ربط بريد مؤكد برمز + استعادة بالبريد
   const regSec = await api('/api/register', { method: 'POST', body: { username: 'sec_user', password: 'Secu1234!' } });
@@ -1120,6 +1332,14 @@ try {
       `sender=${regPS.status} receiver=${regPR.status}`);
     const tokPS = regPS.data.token, tokPR = regPR.data.token;
 
+    // بوابة الصداقة على خادم Push أيضاً: يتصادقان أولاً حتى تمرّ الرسائل/المكالمات
+    const frPush = await apiPush('/api/friends/request', { method: 'POST', token: tokPS, body: { username: 'push_receiver' } });
+    const reqsPush = await apiPush('/api/friends/requests', { token: tokPR });
+    const incPush = reqsPush.data.incoming?.find((r) => r.from?.username === 'push_sender');
+    const accPush = await apiPush('/api/friends/accept', { method: 'POST', token: tokPR, body: { requestId: incPush?.id } });
+    check('على خادم Push: push_sender و push_receiver يتصادقان أولاً', frPush.status === 201 && accPush.status === 200,
+      `req=${frPush.status} acc=${accPush.status}`);
+
     const pkAnon = await apiPush('/api/push/public-key');
     check('GET /api/push/public-key بلا مصادقة يرجع 401', pkAnon.status === 401, `status=${pkAnon.status}`);
     const pk = await apiPush('/api/push/public-key', { token: tokPR });
@@ -1249,6 +1469,21 @@ try {
     }
     check('اشتراكات Push محدودة بـ ٥ لكل مستخدم', subsOf('push_receiver').length === 5,
       `count=${subsOf('push_receiver').length}`);
+
+    // طلب صداقة وارد لمشترك غير متصل → حمولة Push من نوع friend_request
+    const regPF1 = await apiPush('/api/register', { method: 'POST', body: { username: 'push_friend_a', password: 'Push1234!' } });
+    const regPF2 = await apiPush('/api/register', { method: 'POST', body: { username: 'push_friend_b', password: 'Push1234!' } });
+    check('تسجيل push_friend_a و push_friend_b', regPF1.status === 201 && regPF2.status === 201,
+      `a=${regPF1.status} b=${regPF2.status}`);
+    const subFriendB = await apiPush('/api/push/subscribe', { method: 'POST', token: regPF2.data.token, body: { subscription: fakeSub(42) } });
+    check('push_friend_b يشترك في Push', subFriendB.status === 200, `status=${subFriendB.status}`);
+    const frOffline = await apiPush('/api/friends/request', { method: 'POST', token: regPF1.data.token, body: { username: 'push_friend_b' } });
+    check('push_friend_a يرسل طلب صداقة إلى push_friend_b غير المتصل (201)', frOffline.status === 201,
+      `status=${frOffline.status} err=${frOffline.data.error || ''}`);
+    const capFriend = await waitCapture6((l) => l.type === 'friend_request' && l.username === 'push_friend_b');
+    check('التقاط Push: حمولة طلب صداقة للمشترك غير المتصل (from + body)',
+      !!capFriend && capFriend.from === 'push_friend_a' && capFriend.body === 'أرسل لك طلب صداقة',
+      JSON.stringify(capFriend || {}));
   } finally {
     server6.kill();
     fs.rmSync(dataDir6, { recursive: true, force: true });
