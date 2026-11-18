@@ -75,7 +75,7 @@
 
   <nav class="tabs main-tabs">
     <button id="tab-chats" class="tab active" type="button">المحادثات</button>
-    <button id="tab-people" class="tab" type="button">الأشخاص</button>
+    <button id="tab-people" class="tab" type="button">الأشخاص <span id="people-badge" class="badge tab-badge" hidden></span></button>
   </nav>
 
   <div id="view-chats" class="view">
@@ -84,9 +84,27 @@
   </div>
 
   <div id="view-people" class="view" hidden>
-    <input id="people-search" type="search" placeholder="ابحث باسم المستخدم…">
-    <ul id="people-list" class="list"></ul>
-    <p id="people-empty" class="empty" hidden>لا نتائج</p>
+    <!-- عرض المالك: الدليل الكامل بكل المستخدمين كما هو دائماً -->
+    <div id="people-directory">
+      <input id="people-search" type="search" placeholder="ابحث باسم المستخدم…">
+      <ul id="people-list" class="list"></ul>
+      <p id="people-empty" class="empty" hidden>لا نتائج</p>
+    </div>
+    <!-- عرض المستخدم العادي: بحث بالاسم + طلبات صداقة + أصدقاء -->
+    <div id="people-social" hidden>
+      <h3 class="people-h">🔍 البحث عن أشخاص</h3>
+      <input id="user-search" type="search" placeholder="ابحث باسم المستخدم…" autocomplete="off">
+      <ul id="search-results" class="list"></ul>
+      <p id="search-empty" class="empty" hidden>لا نتائج</p>
+      <div id="friend-requests-wrap" hidden>
+        <h3 class="people-h">🤝 طلبات الصداقة</h3>
+        <ul id="friend-requests-in" class="list"></ul>
+        <ul id="friend-requests-out" class="list"></ul>
+      </div>
+      <h3 class="people-h">👥 أصدقائي</h3>
+      <ul id="friends-list" class="list"></ul>
+      <p id="friends-empty" class="empty">لا أصدقاء بعد — ابحث بالاسم وأرسل طلب صداقة</p>
+    </div>
   </div>
 </section>
 
@@ -233,7 +251,7 @@
     </div>
     <hr class="profile-sep">
     <p class="hint privacy-note">حماية الخصوصية: نمنع حفظ الصور من داخل التطبيق ونخفي المحتوى عند تبديل التطبيقات. ملاحظة: لا يمكن لأي موقع ويب منع لقطات شاشة نظام التشغيل منعاً كاملاً — الحظر الكامل يحتاج نسخة التطبيق الأصلية (أندرويد/آيفون)</p>
-    <p class="hint version-line">الإصدار 1.8.0</p>
+    <p class="hint version-line">الإصدار 1.9.0</p>
   </div>
 </div>
 
@@ -244,6 +262,7 @@
     <div id="user-profile-avatar" class="avatar avatar-lg tappable" title="عرض الصورة بحجم كامل"></div>
     <div id="user-profile-name" class="profile-name"></div>
     <div id="user-profile-status" class="profile-status"></div>
+    <div id="user-profile-relation" class="profile-relation" hidden></div>
     <div class="profile-actions">
       <button id="user-profile-msg" type="button">مراسلة</button>
       <button id="user-profile-voice" type="button" class="ghost">📞 صوت</button>
@@ -291,6 +310,9 @@
   <audio id="remote-audio" autoplay hidden></audio>
   <div id="call-toast" class="call-toast" hidden></div>
 </div>
+
+<!-- تنبيه عابر (Toast) لأحداث الصداقة وأخطاء الخادم -->
+<div id="toast" class="toast" hidden></div>
 
 <script src="/app.js"></script>
 </body>

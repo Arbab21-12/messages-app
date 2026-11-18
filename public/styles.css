@@ -181,6 +181,24 @@ body.app-hidden .profile-panel,
 body.app-hidden .msg-menu,
 body.app-hidden #image-viewer { filter:blur(18px); }
 
+/* الأشخاص والصداقة (للمستخدم العادي) */
+.people-h { margin:18px 0 2px; font-size:16px; }
+.people-h:first-child { margin-top:2px; }
+.tab-badge { background:#c0392b; margin-inline-start:2px; vertical-align:middle; }
+.row-actions { display:flex; gap:6px; align-items:center; flex:none; }
+.mini-btn { padding:7px 12px; font-size:13px; border-radius:9px; }
+.mini-btn.accept { background:var(--brand); color:#fff; }
+.mini-btn.accept:hover { background:var(--brand-dark); }
+.mini-btn.reject { background:transparent; color:#b3261e; border:1px solid var(--border); }
+.mini-btn.reject:hover { background:#fdf0ef; }
+.friend-state { color:var(--muted); font-size:13px; white-space:nowrap; }
+.relation-action { display:flex; gap:6px; align-items:center; }
+.profile-relation { display:flex; gap:8px; align-items:center; justify-content:center; flex-wrap:wrap; }
+.profile-relation .friend-state { font-weight:700; color:var(--brand); }
+
+/* تنبيه عابر (Toast) */
+.toast { position:fixed; left:50%; transform:translateX(-50%); bottom:calc(22px + env(safe-area-inset-bottom)); z-index:130; background:rgba(10,25,20,.88); color:#fff; padding:10px 18px; border-radius:999px; font-size:14px; max-width:88%; text-align:center; box-shadow:0 8px 24px rgba(0,0,0,.25); }
+
 /* لوحة بيانات المالك */
 .admin-view h3 { margin:20px 0 2px; }
 .admin-overview { background:#eef7f2; border:1px solid var(--border); border-radius:12px; padding:10px 12px; margin:6px 0 0; }

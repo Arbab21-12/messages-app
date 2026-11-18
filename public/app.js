@@ -15,7 +15,12 @@ const api = async (path, opts = {}) => {
     headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}), ...(opts.headers || {}) },
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || 'حدث خطأ');
+  if (!res.ok) {
+    const err = new Error(data.error || 'حدث خطأ');
+    err.data = data; // جسم الخطأ كاملاً (فيه code أحياناً — مثل pending_in)
+    err.status = res.status;
+    throw err;
+  }
   return data;
 };
 
@@ -24,6 +29,20 @@ function show(id) {
 }
 function fmtTime(ts) {
   return new Date(ts).toLocaleTimeString('ar', { hour: '2-digit', minute: '2-digit' });
+}
+// تنبيه عابر أسفل الشاشة (أحداث الصداقة، أخطاء الخادم…)
+let toastTimer = null;
+function showToast(msg) {
+  const t = $('toast');
+  if (!t || !msg) return;
+  t.textContent = msg;
+  t.hidden = false;
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.hidden = true; }, 3400);
+}
+/** هل حسابي هو حساب المالك؟ (يقرّره الخادم في /api/me — isAdmin) */
+function isAdminMe() {
+  return !!(me && me.isAdmin);
 }
 function ticks(m) {
   if (m.readAt) return '<span class="ticks read">✓✓ مقروءة</span>';
@@ -71,22 +90,63 @@ function wireProfileTap(li, username) {
   if (nameEl) nameEl.addEventListener('click', (e) => { e.stopPropagation(); openUserProfile(username); });
 }
 
-let viewedUser = null; // { username, avatar } — المستخدم المعروض في لوحة الملف
+let viewedUser = null; // { username, avatar, relation, isAdmin } — المستخدم المعروض في لوحة الملف
 async function openUserProfile(username) {
   if (!me || !username) return;
   if (username === me.username) { openProfile(); return; } // ملفي أنا → لوحة التحرير
-  viewedUser = { username, avatar: avatarFor(username) };
+  viewedUser = { username, avatar: avatarFor(username), relation: null, isAdmin: false };
   $('user-profile-name').textContent = username;
   setAvatarEl($('user-profile-avatar'), username, viewedUser.avatar);
   $('user-profile-status').textContent = onlineUsers.has(username) ? 'متصل الآن' : 'غير متصل';
+  $('user-profile-relation').hidden = true; // تُعرض بعد وصول العلاقة من الخادم
   $('user-profile-panel').hidden = false;
   try {
     const data = await api('/api/users/' + encodeURIComponent(username));
     if (!viewedUser || viewedUser.username !== username) return; // أُغلقت/تغيّرت أثناء الجلب
-    viewedUser = { username: data.username, avatar: data.avatar || null };
+    viewedUser = { username: data.username, avatar: data.avatar || null, relation: data.relation || 'none', isAdmin: !!data.isAdmin };
     noteAvatar(data.username, data.avatar);
     setAvatarEl($('user-profile-avatar'), data.username, data.avatar);
     $('user-profile-status').textContent = data.online ? 'متصل الآن' : 'غير متصل';
+    renderProfileRelation();
+  } catch {}
+}
+/** أزرار الصداقة داخل لوحة ملف مستخدم: تظهر للمستخدم العادي فقط، ولا تظهر
+ *  أبداً عند عرض ملف المالك (هو خارج نظام الصداقة). */
+function renderProfileRelation() {
+  const box = $('user-profile-relation');
+  if (!box) return;
+  if (!viewedUser || !me || isAdminMe() || viewedUser.isAdmin || viewedUser.relation == null) {
+    box.hidden = true;
+    box.innerHTML = '';
+    return;
+  }
+  box.hidden = false;
+  box.innerHTML = '';
+  if (viewedUser.relation === 'friends') {
+    const state = document.createElement('span');
+    state.className = 'friend-state';
+    state.textContent = 'أصدقاء ✓';
+    const un = document.createElement('button');
+    un.type = 'button';
+    un.className = 'ghost';
+    un.textContent = 'إلغاء الصداقة';
+    un.onclick = () => unfriend(viewedUser.username);
+    box.appendChild(state);
+    box.appendChild(un);
+  } else {
+    box.appendChild(relationActionEl(viewedUser.username, viewedUser.relation));
+  }
+}
+/** إعادة جلب علاقة المستخدم المعروض بعد أي إجراء صداقة (قبول/إلغاء…). */
+async function refreshProfileRelation() {
+  if (!viewedUser) return;
+  const username = viewedUser.username;
+  try {
+    const data = await api('/api/users/' + encodeURIComponent(username));
+    if (!viewedUser || viewedUser.username !== username) return;
+    viewedUser.relation = data.relation || 'none';
+    viewedUser.isAdmin = !!data.isAdmin;
+    renderProfileRelation();
   } catch {}
 }
 function closeUserProfile() {
@@ -316,25 +376,46 @@ async function enterApp() {
   noteAvatar(me.username, me.avatar);
   setAvatarEl($('my-avatar'), me.username, me.avatar);
   syncAdminBtn();
+  // تبويب «الأشخاص»: المالك يرى الدليل الكامل، والعادي يرى البحث/الطلبات/الأصدقاء
+  $('people-directory').hidden = !isAdminMe();
+  $('people-social').hidden = isAdminMe();
   show('main-screen');
   connectWs();
   await loadConversations();
+  if (!isAdminMe()) loadFriendState(); // تهيئة شارة طلبات الصداقة
 }
 
+let wsAuthed = false; // هل أكمل هذا الاتصال مصادقته؟ (لتمييز أخطاء الإرسال عن خطأ الجلسة)
 function connectWs() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws`);
+  wsAuthed = false;
   ws.onopen = () => ws.send(JSON.stringify({ type: 'auth', token }));
   ws.onmessage = (ev) => {
     const data = JSON.parse(ev.data);
-    if (data.type === 'authed') { $('conn-dot').classList.add('online'); $('conn-dot').classList.remove('offline'); }
+    if (data.type === 'authed') { wsAuthed = true; $('conn-dot').classList.add('online'); $('conn-dot').classList.remove('offline'); }
     if (data.type === 'presence') {
       onlineUsers = new Set(data.online);
       updatePresenceUI();
       if (viewedUser && !$('user-profile-panel').hidden) {
         $('user-profile-status').textContent = onlineUsers.has(viewedUser.username) ? 'متصل الآن' : 'غير متصل';
       }
-      loadPeople($('people-search').value.trim());
+      refreshPeople();
+    }
+    if (data.type === 'friend_request') {
+      showToast('طلب صداقة جديد من ' + (data.from?.username || ''));
+      if (notifySettings.messageSound) messageBeep();
+      loadFriendState();
+      if (searchQuery && !$('view-people').hidden) loadSearch(searchQuery);
+    }
+    if (data.type === 'friend_accepted') {
+      showToast('قبل ' + (data.from?.username || '') + ' طلب صداقتك');
+      loadFriendState();
+      if (searchQuery && !$('view-people').hidden) loadSearch(searchQuery);
+    }
+    if (data.type === 'error' && wsAuthed && data.error) {
+      // رفض خادمي لرسالة (بوابة الصداقة مثلاً) — يُعرض كما أرسله الخادم
+      showToast(data.error);
     }
     if (data.type === 'message') {
       const m = data.message;
@@ -412,6 +493,8 @@ async function loadConversations() {
 }
 
 // ---------- الأشخاص ----------
+// المالك: دليل كامل بكل المستخدمين كما هو دائماً (loadPeople).
+// المستخدم العادي: بحث بالاسم + طلبات صداقة + قائمة أصدقاء (الوحدة التالية).
 async function loadPeople(q = '') {
   if (!me || $('view-people').hidden) return;
   const { users } = await api('/api/users' + (q ? '?q=' + encodeURIComponent(q) : ''));
@@ -435,16 +518,257 @@ async function loadPeople(q = '') {
 }
 $('people-search').addEventListener('input', (e) => loadPeople(e.target.value.trim()));
 
+/** تحديث منطقة الأشخاص بما يناسب نوع حسابي — يُستدعى عند تغيّر الحضور. */
+function refreshPeople() {
+  if (!me) return;
+  if (isAdminMe()) {
+    if (!$('view-people').hidden) loadPeople($('people-search').value.trim());
+  } else {
+    loadFriendState(); // يحدّث الأصدقاء/الطلبات/الشارة (والحضور داخل القوائم)
+  }
+}
+
 function setMainTab(which) {
   $('tab-chats').classList.toggle('active', which === 'chats');
   $('tab-people').classList.toggle('active', which === 'people');
   $('view-chats').hidden = which !== 'chats';
   $('view-people').hidden = which !== 'people';
-  if (which === 'people') loadPeople($('people-search').value.trim());
-  else loadConversations();
+  if (which === 'people') {
+    if (isAdminMe()) loadPeople($('people-search').value.trim());
+    else {
+      loadFriendState();
+      if (searchQuery) loadSearch(searchQuery);
+    }
+  } else loadConversations();
 }
 $('tab-chats').onclick = () => setMainTab('chats');
 $('tab-people').onclick = () => setMainTab('people');
+
+// ---------- البحث عن أشخاص + طلبات الصداقة + الأصدقاء (للمستخدم العادي) ----------
+let friendState = { incoming: [], outgoing: [], friends: [] };
+let searchQuery = '';
+
+function findIncoming(username) {
+  return friendState.incoming.find((r) => r.from && r.from.username === username) || null;
+}
+function findOutgoing(username) {
+  return friendState.outgoing.find((r) => r.to && r.to.username === username) || null;
+}
+function updatePeopleBadge() {
+  const badge = $('people-badge');
+  const n = friendState.incoming.length;
+  badge.hidden = n === 0;
+  badge.textContent = n ? String(n) : '';
+}
+
+/** جلب الطلبات + الأصدقاء من الخادم وإعادة عرضها وتحديث الشارة. */
+async function loadFriendState() {
+  if (!me || isAdminMe()) return;
+  try {
+    const [reqs, fr] = await Promise.all([api('/api/friends/requests'), api('/api/friends')]);
+    friendState = {
+      incoming: reqs.incoming || [],
+      outgoing: reqs.outgoing || [],
+      friends: fr.friends || [],
+    };
+  } catch { return; }
+  renderFriendRequests();
+  renderFriends();
+  updatePeopleBadge();
+}
+
+function renderFriendRequests() {
+  const wrap = $('friend-requests-wrap');
+  if (!wrap) return;
+  wrap.hidden = !(friendState.incoming.length || friendState.outgoing.length);
+  const inList = $('friend-requests-in');
+  inList.innerHTML = '';
+  for (const r of friendState.incoming) {
+    const li = document.createElement('li');
+    noteAvatar(r.from.username, r.from.avatarUrl);
+    li.innerHTML = `
+      ${avatarHtml(r.from.username, r.from.avatarUrl)}
+      <div class="row-main">
+        <div class="row-title"><span>${escapeHtml(r.from.username)}</span></div>
+        <div class="row-sub">طلب صداقة وارد</div>
+      </div>
+      <span class="row-actions">
+        <button type="button" class="mini-btn accept">قبول</button>
+        <button type="button" class="mini-btn reject">رفض</button>
+      </span>`;
+    li.querySelector('.accept').onclick = (e) => { e.stopPropagation(); friendAction('accept', r.id); };
+    li.querySelector('.reject').onclick = (e) => { e.stopPropagation(); friendAction('reject', r.id); };
+    wireProfileTap(li, r.from.username);
+    inList.appendChild(li);
+  }
+  const outList = $('friend-requests-out');
+  outList.innerHTML = '';
+  for (const r of friendState.outgoing) {
+    const li = document.createElement('li');
+    noteAvatar(r.to.username, r.to.avatarUrl);
+    li.innerHTML = `
+      ${avatarHtml(r.to.username, r.to.avatarUrl)}
+      <div class="row-main">
+        <div class="row-title"><span>${escapeHtml(r.to.username)}</span></div>
+        <div class="row-sub">بانتظار القبول</div>
+      </div>
+      <span class="row-actions">
+        <button type="button" class="mini-btn reject">إلغاء</button>
+      </span>`;
+    li.querySelector('.reject').onclick = (e) => { e.stopPropagation(); friendAction('cancel', r.id); };
+    wireProfileTap(li, r.to.username);
+    outList.appendChild(li);
+  }
+}
+
+function renderFriends() {
+  const list = $('friends-list');
+  if (!list) return;
+  list.innerHTML = '';
+  $('friends-empty').hidden = friendState.friends.length > 0;
+  for (const f of friendState.friends) {
+    const on = onlineUsers.has(f.username);
+    const li = document.createElement('li');
+    noteAvatar(f.username, f.avatarUrl);
+    li.innerHTML = `
+      ${avatarHtml(f.username, f.avatarUrl)}
+      <div class="row-main">
+        <div class="row-title"><span>${escapeHtml(f.username)}</span></div>
+        <div class="row-sub">${on ? 'متصل الآن' : 'غير متصل'}</div>
+      </div>`;
+    li.onclick = () => openChat(f.username, f.avatarUrl);
+    wireProfileTap(li, f.username);
+    list.appendChild(li);
+  }
+}
+
+/** إجراءات الصداقة (قبول/رفض/إلغاء) — ثم تحديث كل الواجهات المتأثرة. */
+async function friendAction(action, requestId) {
+  try {
+    await api('/api/friends/' + action, { method: 'POST', body: JSON.stringify({ requestId }) });
+    if (action === 'accept') showToast('أصبحتما أصدقاء');
+  } catch (err) {
+    showToast(err.message || 'حدث خطأ');
+  }
+  await loadFriendState();
+  if (searchQuery && !$('view-people').hidden) loadSearch(searchQuery);
+  if (viewedUser) refreshProfileRelation();
+}
+
+async function sendFriendRequest(username) {
+  try {
+    await api('/api/friends/request', { method: 'POST', body: JSON.stringify({ username }) });
+    showToast('أُرسل طلب الصداقة إلى ' + username);
+  } catch (err) {
+    if (err && err.data && err.data.code === 'pending_in') {
+      showToast('لديك طلب صداقة منه — اقبله');
+    } else {
+      showToast(err.message || 'فشل إرسال طلب الصداقة');
+    }
+  }
+  await loadFriendState();
+  if (searchQuery && !$('view-people').hidden) loadSearch(searchQuery);
+  if (viewedUser) refreshProfileRelation();
+}
+
+async function unfriend(username) {
+  try {
+    await api('/api/friends/remove', { method: 'POST', body: JSON.stringify({ username }) });
+    showToast('أُلغيت الصداقة مع ' + username);
+  } catch (err) {
+    showToast(err.message || 'حدث خطأ');
+  }
+  await loadFriendState();
+  if (searchQuery && !$('view-people').hidden) loadSearch(searchQuery);
+  if (viewedUser) refreshProfileRelation();
+}
+
+/** عنصر إجراء العلاقة لصفّ مستخدم — يُبنى بحسب حالتها الحالية. */
+function relationActionEl(username, relation) {
+  const span = document.createElement('span');
+  span.className = 'relation-action';
+  const mkBtn = (label, cls, fn) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'mini-btn ' + cls;
+    b.textContent = label;
+    b.onclick = (e) => { e.stopPropagation(); fn(); };
+    return b;
+  };
+  if (relation === 'friends') {
+    span.innerHTML = '<span class="friend-state">أصدقاء ✓</span>';
+  } else if (relation === 'pending_out') {
+    const state = document.createElement('span');
+    state.className = 'friend-state';
+    state.textContent = 'بانتظار القبول';
+    span.appendChild(state);
+    span.appendChild(mkBtn('إلغاء', 'reject', () => {
+      const r = findOutgoing(username);
+      if (r) friendAction('cancel', r.id);
+      else loadFriendState();
+    }));
+  } else if (relation === 'pending_in') {
+    span.appendChild(mkBtn('قبول', 'accept', () => {
+      const r = findIncoming(username);
+      if (r) friendAction('accept', r.id);
+      else loadFriendState();
+    }));
+    span.appendChild(mkBtn('رفض', 'reject', () => {
+      const r = findIncoming(username);
+      if (r) friendAction('reject', r.id);
+      else loadFriendState();
+    }));
+  } else {
+    span.appendChild(mkBtn('➕ إضافة صديق', 'accept', () => sendFriendRequest(username)));
+  }
+  return span;
+}
+
+// البحث بالاسم: إدخال مُرشَّح (debounce) — بلا نص لا نتائج (اكتشاف بالبحث فقط)
+let searchTimer = null;
+$('user-search').addEventListener('input', (e) => {
+  const q = e.target.value.trim();
+  searchQuery = q;
+  if (searchTimer) clearTimeout(searchTimer);
+  if (!q) {
+    $('search-results').innerHTML = '';
+    $('search-empty').hidden = true;
+    return;
+  }
+  searchTimer = setTimeout(() => loadSearch(q), 300);
+});
+async function loadSearch(q) {
+  if (!me || isAdminMe() || !q) return;
+  let users;
+  try {
+    ({ users } = await api('/api/users/search?q=' + encodeURIComponent(q)));
+  } catch { return; }
+  if (searchQuery !== q) return; // تجاوزها بحث أحدث أثناء الجلب
+  renderSearchResults(users || []);
+}
+function renderSearchResults(users) {
+  const list = $('search-results');
+  list.innerHTML = '';
+  $('search-empty').hidden = users.length > 0;
+  for (const u of users) {
+    const on = onlineUsers.has(u.username);
+    const li = document.createElement('li');
+    noteAvatar(u.username, u.avatarUrl);
+    li.innerHTML = `
+      ${avatarHtml(u.username, u.avatarUrl)}
+      <div class="row-main">
+        <div class="row-title"><span>${escapeHtml(u.username)}</span></div>
+        <div class="row-sub">${on ? 'متصل الآن' : 'غير متصل'}</div>
+      </div>`;
+    const actions = document.createElement('span');
+    actions.className = 'row-actions';
+    actions.appendChild(relationActionEl(u.username, u.relation));
+    li.appendChild(actions);
+    if (u.relation === 'friends') li.onclick = () => openChat(u.username, u.avatarUrl);
+    wireProfileTap(li, u.username);
+    list.appendChild(li);
+  }
+}
 
 // ---------- المحادثة ----------
 async function openChat(username, avatar) {
@@ -1283,6 +1607,7 @@ function handleCallEvent(data) {
       break;
     }
     case 'call_reject': if (call) endCallWithMessage('تم رفض المكالمة'); break;
+    case 'call_error': if (call) endCallWithMessage(data.error || 'لا يمكنك الاتصال بهذا المستخدم'); break;
     case 'call_busy': if (call) endCallWithMessage('المستخدم مشغول في مكالمة أخرى'); break;
     case 'call_unavailable': if (call) endCallWithMessage('المستخدم غير متصل الآن'); break;
     case 'call_end': if (call) endCallWithMessage('انتهت المكالمة'); break;
@@ -1563,7 +1888,7 @@ function refreshMyIdentity() {
   $('profile-name').textContent = me.username;
   setAvatarEl($('profile-avatar'), me.username, me.avatar);
   loadConversations();
-  if (!$('view-people').hidden) loadPeople($('people-search').value.trim());
+  refreshPeople();
 }
 
 $('avatar-change-btn').onclick = () => { if (!uploading) $('avatar-input').click(); };
