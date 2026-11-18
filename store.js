@@ -12,7 +12,10 @@
  *   listAllUsers, getAllMessages, listUploads, setUploadKind,
  *   createEmailCode, getEmailCode, deleteEmailCode, bumpEmailCodeAttempts,
  *   getEmailCodeLastSentAt, deleteSessionsForUser,
- *   addPushSubscription, removePushSubscription, getPushSubscriptions
+ *   addPushSubscription, removePushSubscription, getPushSubscriptions,
+ *   getFriendship, listFriendIds, addFriendship, removeFriendship,
+ *   createRequest, getRequest, getRequestBetween, deleteRequest,
+ *   listIncomingRequests, listOutgoingRequests
  */
 const fs = require('fs');
 const path = require('path');
@@ -20,7 +23,7 @@ const path = require('path');
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'data.json');
 
-let db = { users: [], messages: [], sessions: {}, uploads: {}, nameReservations: [], emailCodes: [], emailCodeSentAt: {} };
+let db = { users: [], messages: [], sessions: {}, uploads: {}, nameReservations: [], emailCodes: [], emailCodeSentAt: {}, friendRequests: [], friendships: [] };
 
 function load() {
   try {
@@ -34,9 +37,11 @@ function load() {
       nameReservations: Array.isArray(parsed.nameReservations) ? parsed.nameReservations : [],
       emailCodes: Array.isArray(parsed.emailCodes) ? parsed.emailCodes : [],
       emailCodeSentAt: parsed.emailCodeSentAt && typeof parsed.emailCodeSentAt === 'object' ? parsed.emailCodeSentAt : {},
+      friendRequests: Array.isArray(parsed.friendRequests) ? parsed.friendRequests : [],
+      friendships: Array.isArray(parsed.friendships) ? parsed.friendships : [],
     };
   } catch {
-    db = { users: [], messages: [], sessions: {}, uploads: {}, nameReservations: [], emailCodes: [], emailCodeSentAt: {} };
+    db = { users: [], messages: [], sessions: {}, uploads: {}, nameReservations: [], emailCodes: [], emailCodeSentAt: {}, friendRequests: [], friendships: [] };
   }
 }
 
@@ -214,6 +219,69 @@ function getPushSubscriptions(userId) {
   return user && Array.isArray(user.pushSubscriptions) ? user.pushSubscriptions.slice() : [];
 }
 
+// ---------- الصداقات وطلبات الصداقة ----------
+// الصداقات: أزواج مقبولة { aId, bId, createdAt } — الزوج غير مرتّب الاتجاه،
+// والبحث يطابق كلا الاتجاهين. طلبات الصداقة: المعلّقة فقط { id, fromId, toId,
+// createdAt } — القبول يحوّلها إلى صداقة ويحذفها، والرفض/الإلغاء يحذفها فقط.
+// حساب المالك (ADMIN_USERNAME) خارج هذا النظام كلياً بفرضٍ من الخادم.
+function samePair(f, aId, bId) {
+  return (f.aId === aId && f.bId === bId) || (f.aId === bId && f.bId === aId);
+}
+function getFriendship(aId, bId) {
+  return db.friendships.find((f) => samePair(f, aId, bId)) || null;
+}
+function listFriendIds(userId) {
+  const out = [];
+  for (const f of db.friendships) {
+    if (f.aId === userId) out.push(f.bId);
+    else if (f.bId === userId) out.push(f.aId);
+  }
+  return out;
+}
+function addFriendship(aId, bId) {
+  const existing = getFriendship(aId, bId);
+  if (existing) return existing;
+  const friendship = { aId, bId, createdAt: Date.now() };
+  db.friendships.push(friendship);
+  save();
+  return friendship;
+}
+function removeFriendship(aId, bId) {
+  const before = db.friendships.length;
+  db.friendships = db.friendships.filter((f) => !samePair(f, aId, bId));
+  if (db.friendships.length !== before) {
+    save();
+    return true;
+  }
+  return false;
+}
+function createRequest(req) {
+  db.friendRequests.push(req);
+  save();
+  return req;
+}
+function getRequest(id) {
+  return db.friendRequests.find((r) => r.id === id) || null;
+}
+function getRequestBetween(fromId, toId) {
+  return db.friendRequests.find((r) => r.fromId === fromId && r.toId === toId) || null;
+}
+function deleteRequest(id) {
+  const before = db.friendRequests.length;
+  db.friendRequests = db.friendRequests.filter((r) => r.id !== id);
+  if (db.friendRequests.length !== before) {
+    save();
+    return true;
+  }
+  return false;
+}
+function listIncomingRequests(userId) {
+  return db.friendRequests.filter((r) => r.toId === userId).sort((a, b) => a.createdAt - b.createdAt);
+}
+function listOutgoingRequests(userId) {
+  return db.friendRequests.filter((r) => r.fromId === userId).sort((a, b) => a.createdAt - b.createdAt);
+}
+
 // ---------- الرسائل ----------
 function addMessage(msg) {
   db.messages.push(msg);
@@ -323,6 +391,16 @@ module.exports = {
   addPushSubscription,
   removePushSubscription,
   getPushSubscriptions,
+  getFriendship,
+  listFriendIds,
+  addFriendship,
+  removeFriendship,
+  createRequest,
+  getRequest,
+  getRequestBetween,
+  deleteRequest,
+  listIncomingRequests,
+  listOutgoingRequests,
   addMessage,
   getConversation,
   getAllConversationsFor,

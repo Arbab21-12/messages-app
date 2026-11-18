@@ -28,6 +28,11 @@ const USERNAME_TAKEN_ERROR = 'اسم المستخدم هذا مستخدم من �
 // اسم مستخدم المالك (Admin) — يُضبط من البيئة فقط. عند فراغه تُعطَّل لوحة البيانات
 // كلّياً (نقاط /api/admin/* ترجع 404). المطابقة دقيقة لحالة الأحرف.
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || '';
+/** هل هذا المستخدم هو حساب المالك؟ نفس قاعدة لوحة البيانات: مطابقة دقيقة
+ *  لاسم المستخدم مع ADMIN_USERNAME المضبوط في البيئة (وبلا ضبط لا مالك). */
+function isAdminUser(user) {
+  return !!user && !!ADMIN_USERNAME && user.username === ADMIN_USERNAME;
+}
 
 // ---------- إشعارات Push (VAPID) ----------
 // المفاتيح من البيئة فقط. عند غيابها (أو فشل ضبطها) تُعطَّل نقاط /api/push/*
@@ -106,7 +111,7 @@ function publicUser(u) {
     username: u.username,
     createdAt: u.createdAt,
     avatar: store.avatarUrl(u),
-    isAdmin: !!ADMIN_USERNAME && u.username === ADMIN_USERNAME,
+    isAdmin: isAdminUser(u),
   };
 }
 /** مسلسِل «نفسي» لاستجابات المستخدم عن حسابه هو فقط (/api/me والتسجيل والدخول
@@ -461,16 +466,215 @@ app.post('/api/push/unsubscribe', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- دليل المستخدمين ----------
-app.get('/api/users', requireAuth, (req, res) => {
-  res.json({ users: store.listUsers(req.user.id, req.query.q || '') });
+// ---------- الصداقة: علاقات وبوابة المحادثات الجديدة ----------
+// نظام الصداقة للمستخدمين العاديين فقط: حساب المالك خارج النظام كلياً — لا
+// طلبات صداقة إليه أو منه، ولا يظهر في بحث الأشخاص عند العاديين، ويحتفظ هو
+// بتصفّح الجميع ومراسلة/مكالمة أي شخص كما هو. بدء محادثة جديدة (رسالة أو
+// مكالمة) مع غريب محظور على الخادم نفسه حتى قبول طلب الصداقة؛ أما المحادثات
+// القائمة فلا تُحظر أبداً (حتى بعد إلغاء الصداقة، وحتى الردود على المالك).
+const FRIEND_GATE_MESSAGE_ERROR = 'للبدء بمحادثة جديدة أرسل طلب صداقة أولاً وانتظر قبوله';
+const FRIEND_GATE_CALL_ERROR = 'لا يمكنك الاتصال بهذا المستخدم قبل قبول طلب الصداقة';
+
+/** حالة العلاقة بينّي وبين مستخدم آخر: friends | pending_out | pending_in | none */
+function relationStatus(meId, otherId) {
+  if (store.getFriendship(meId, otherId)) return 'friends';
+  if (store.getRequestBetween(meId, otherId)) return 'pending_out';
+  if (store.getRequestBetween(otherId, meId)) return 'pending_in';
+  return 'none';
+}
+function hasConversation(aId, bId) {
+  return store.getConversation(aId, bId).length > 0;
+}
+/** هل يحق لـ me بدء التواصل مع other الآن؟ نعم إن كان المالك نفسه، أو بينهما
+ *  محادثة قائمة (استمرارية — تشمل الرد على المالك بعد أن راسله هو أولاً)،
+ *  أو كانا صديقين. */
+function canStartNewConversation(meUser, otherUser) {
+  if (!meUser || !otherUser) return false;
+  if (meUser.id === otherUser.id) return true;
+  if (isAdminUser(meUser)) return true;
+  if (hasConversation(meUser.id, otherUser.id)) return true;
+  if (store.getFriendship(meUser.id, otherUser.id)) return true;
+  return false;
+}
+/** إشعار حدث صداقة: لحظياً عبر WebSocket إن كان الهدف متصلاً، وإلا Push. */
+function notifyFriendEvent(targetUser, wsEvent, pushPayload) {
+  const delivered = sendToUser(targetUser.id, wsEvent);
+  if (!delivered) sendPush(targetUser.id, pushPayload);
+}
+
+// ---------- البحث عن أشخاص (اكتشاف بالاسم) ----------
+// بحث بمطابقة جزئية غير حسّاسة للحالة على الأسماء المخزّنة بدقّتها. المستخدم
+// العادي لا يرى حساب المالك هنا أبداً؛ والمالك يرى الجميع (relation عنده none).
+app.get('/api/users/search', requireAuth, (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.json({ users: [] });
+  const meAdmin = isAdminUser(req.user);
+  const users = store.listUsers(req.user.id, q)
+    .filter((u) => meAdmin || !isAdminUser(u))
+    .map((u) => ({
+      id: u.id,
+      username: u.username,
+      avatarUrl: u.avatar,
+      online: isUserOnline(u.id),
+      relation: meAdmin ? 'none' : relationStatus(req.user.id, u.id),
+    }));
+  res.json({ users });
 });
 
-// عرض ملف مستخدم واحد: الاسم + رابط الصورة الشخصية (أو null) + حالة الاتصال الآن
+// ---------- طلبات الصداقة والأصدقاء ----------
+// كل نقاط /api/friends/* محرّمة على حساب المالك (403): هو خارج النظام كلياً.
+function requireNonAdmin(req, res, next) {
+  if (isAdminUser(req.user)) {
+    return res.status(403).json({ error: 'حساب المالك خارج نظام الصداقة' });
+  }
+  next();
+}
+
+app.post('/api/friends/request', requireAuth, requireNonAdmin, (req, res) => {
+  const username = String((req.body || {}).username || '').trim();
+  const target = username ? store.getUserByUsername(username) : null;
+  if (!target) return res.status(404).json({ error: 'المستخدم غير موجود' });
+  if (target.id === req.user.id) {
+    return res.status(400).json({ error: 'لا يمكنك إرسال طلب صداقة لنفسك' });
+  }
+  if (isAdminUser(target)) {
+    return res.status(400).json({ error: 'هذا الحساب غير متاح لطلبات الصداقة' });
+  }
+  const rel = relationStatus(req.user.id, target.id);
+  if (rel === 'friends') return res.status(400).json({ error: 'أنتما أصدقاء بالفعل' });
+  if (rel === 'pending_out') {
+    return res.status(400).json({ error: 'أرسلت طلب صداقة لهذا المستخدم من قبل وما زال بانتظار القبول' });
+  }
+  if (rel === 'pending_in') {
+    return res.status(400).json({
+      error: 'هذا المستخدم أرسل لك طلب صداقة بالفعل — اقبله من قائمة الطلبات',
+      code: 'pending_in',
+    });
+  }
+  const request = store.createRequest({
+    id: crypto.randomUUID(),
+    fromId: req.user.id,
+    toId: target.id,
+    createdAt: Date.now(),
+  });
+  notifyFriendEvent(
+    target,
+    { type: 'friend_request', from: { username: req.user.username, avatarUrl: store.avatarUrl(req.user) } },
+    { type: 'friend_request', from: req.user.username, title: req.user.username, body: 'أرسل لك طلب صداقة' }
+  );
+  res.status(201).json({
+    ok: true,
+    request: {
+      id: request.id,
+      to: { username: target.username, avatarUrl: store.avatarUrl(target) },
+      createdAt: request.createdAt,
+    },
+  });
+});
+
+app.get('/api/friends/requests', requireAuth, requireNonAdmin, (req, res) => {
+  const brief = (u) => (u ? { username: u.username, avatarUrl: store.avatarUrl(u) } : null);
+  res.json({
+    incoming: store.listIncomingRequests(req.user.id)
+      .map((r) => ({ id: r.id, from: brief(store.getUserById(r.fromId)), createdAt: r.createdAt }))
+      .filter((r) => r.from),
+    outgoing: store.listOutgoingRequests(req.user.id)
+      .map((r) => ({ id: r.id, to: brief(store.getUserById(r.toId)), createdAt: r.createdAt }))
+      .filter((r) => r.to),
+  });
+});
+
+app.post('/api/friends/accept', requireAuth, requireNonAdmin, (req, res) => {
+  const request = store.getRequest(String((req.body || {}).requestId || ''));
+  if (!request) return res.status(404).json({ error: 'طلب الصداقة غير موجود' });
+  if (request.toId !== req.user.id) {
+    return res.status(403).json({ error: 'قبول طلب الصداقة متاح لمستقبِله فقط' });
+  }
+  const sender = store.getUserById(request.fromId);
+  store.addFriendship(request.fromId, request.toId);
+  store.deleteRequest(request.id);
+  if (sender) {
+    notifyFriendEvent(
+      sender,
+      { type: 'friend_accepted', from: { username: req.user.username } },
+      { type: 'friend_accepted', from: req.user.username, title: req.user.username, body: 'قبل طلب صداقتك' }
+    );
+  }
+  res.json({ ok: true });
+});
+
+app.post('/api/friends/reject', requireAuth, requireNonAdmin, (req, res) => {
+  const request = store.getRequest(String((req.body || {}).requestId || ''));
+  if (!request) return res.status(404).json({ error: 'طلب الصداقة غير موجود' });
+  if (request.toId !== req.user.id) {
+    return res.status(403).json({ error: 'رفض طلب الصداقة متاح لمستقبِله فقط' });
+  }
+  store.deleteRequest(request.id); // الرفض صامت: لا إشعار للمرسِل
+  res.json({ ok: true });
+});
+
+app.post('/api/friends/cancel', requireAuth, requireNonAdmin, (req, res) => {
+  const request = store.getRequest(String((req.body || {}).requestId || ''));
+  if (!request) return res.status(404).json({ error: 'طلب الصداقة غير موجود' });
+  if (request.fromId !== req.user.id) {
+    return res.status(403).json({ error: 'إلغاء طلب الصداقة متاح لمرسِله فقط' });
+  }
+  store.deleteRequest(request.id);
+  res.json({ ok: true });
+});
+
+app.get('/api/friends', requireAuth, requireNonAdmin, (req, res) => {
+  const friends = store.listFriendIds(req.user.id)
+    .map((id) => store.getUserById(id))
+    .filter(Boolean)
+    .map((u) => ({
+      id: u.id,
+      username: u.username,
+      avatarUrl: store.avatarUrl(u),
+      online: isUserOnline(u.id),
+    }))
+    .sort((a, b) => a.username.localeCompare(b.username));
+  res.json({ friends });
+});
+
+// إلغاء الصداقة: تُحذف الصداقة وحدها — سجل المحادثة يبقى كاملاً وقابلاً للمتابعة.
+app.post('/api/friends/remove', requireAuth, requireNonAdmin, (req, res) => {
+  const target = store.getUserByUsername(String((req.body || {}).username || ''));
+  if (!target) return res.status(404).json({ error: 'المستخدم غير موجود' });
+  if (!store.removeFriendship(req.user.id, target.id)) {
+    return res.status(400).json({ error: 'أنتما لستما أصدقاء' });
+  }
+  res.json({ ok: true });
+});
+
+// ---------- دليل المستخدمين ----------
+// المالك: الدليل الكامل كما هو دائماً. المستخدم العادي: أصدقاؤه وشركاء
+// محادثاته فقط — لا يستطيع تعداد كل المستخدمين من هذه النقطة (الاكتشاف
+// بالبحث بالاسم عبر /api/users/search).
+app.get('/api/users', requireAuth, (req, res) => {
+  const all = store.listUsers(req.user.id, req.query.q || '');
+  if (isAdminUser(req.user)) return res.json({ users: all });
+  const allowed = new Set(store.listFriendIds(req.user.id));
+  for (const m of store.getAllConversationsFor(req.user.id)) {
+    allowed.add(m.fromId === req.user.id ? m.toId : m.fromId);
+  }
+  res.json({ users: all.filter((u) => allowed.has(u.id)) });
+});
+
+// عرض ملف مستخدم واحد: الاسم + رابط الصورة الشخصية (أو null) + حالة الاتصال
+// الآن + هل هو حساب المالك + حالة العلاقة معه (لعرض أزرار الصداقة المناسبة)
 app.get('/api/users/:username', requireAuth, (req, res) => {
   const u = store.getUserByUsername(req.params.username);
   if (!u) return res.status(404).json({ error: 'المستخدم غير موجود' });
-  res.json({ username: u.username, avatar: store.avatarUrl(u), online: isUserOnline(u.id) });
+  res.json({
+    username: u.username,
+    avatar: store.avatarUrl(u),
+    online: isUserOnline(u.id),
+    isAdmin: isAdminUser(u),
+    relation: isAdminUser(req.user) || u.id === req.user.id
+      ? 'none'
+      : relationStatus(req.user.id, u.id),
+  });
 });
 
 // ---------- المحادثات والرسائل ----------
@@ -523,6 +727,11 @@ app.post('/api/messages/:username/read', requireAuth, (req, res) => {
 app.post('/api/messages/:username', requireAuth, (req, res) => {
   const other = store.getUserByUsername(req.params.username);
   if (!other) return res.status(404).json({ error: 'المستخدم غير موجود' });
+  // بوابة الصداقة: بدء محادثة جديدة مع غريب ممنوع حتى قبول طلب الصداقة —
+  // الرسائل داخل محادثة قائمة لا تُحظر أبداً (canStartNewConversation يراعيها)
+  if (!canStartNewConversation(req.user, other)) {
+    return res.status(403).json({ error: FRIEND_GATE_MESSAGE_ERROR });
+  }
   const body = req.body || {};
   // رسالة وسائط: تشير إلى ملف رُفع مسبقاً عبر /api/upload
   if (body.fileId) {
@@ -995,6 +1204,12 @@ function handleCallSignal(ws, me, data) {
       wsSend(ws, { type: 'call_unavailable', with: data.to || null });
       return;
     }
+    // بوابة الصداقة للمكالمات: لا دعوة لغريب بلا محادثة قائمة وبلا صداقة —
+    // الخطأ يصل المتصل وحده ولا يُمرَّر أي شيء للمدعو ولا يُسجَّل أي سجل مكالمة
+    if (!canStartNewConversation(me, to)) {
+      wsSend(ws, { type: 'call_error', with: to.username, error: FRIEND_GATE_CALL_ERROR });
+      return;
+    }
     if (callByUser.has(me.id)) return; // المتصل نفسه في مكالمة أصلاً — تجاهل
     const calleeOnline = connections.has(to.id) && connections.get(to.id).size > 0;
     if (!calleeOnline) {
@@ -1127,6 +1342,11 @@ wss.on('connection', (ws) => {
     if (data.type === 'send') {
       const to = data.to ? store.getUserByUsername(String(data.to)) : null;
       if (!to) { wsSend(ws, { type: 'error', error: 'رسالة غير صالحة' }); return; }
+      // بوابة الصداقة (نفس قاعدة REST): بدء محادثة جديدة مع غريب ممنوع
+      if (!canStartNewConversation(me, to)) {
+        wsSend(ws, { type: 'error', error: FRIEND_GATE_MESSAGE_ERROR });
+        return;
+      }
       if (data.fileId) {
         // رسالة وسائط: الملف يجب أن يكون مرفوعاً من هذا المستخدم نفسه
         const up = store.getUpload(String(data.fileId));
