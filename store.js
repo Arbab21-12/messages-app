@@ -9,7 +9,7 @@
  *   listUsers, addMessage, getConversation, markConversationRead,
  *   markDelivered, getUndeliveredFor,
  *   getNameReservation, addNameReservation, removeNameReservation,
- *   listAllUsers, getAllMessages, listUploads,
+ *   listAllUsers, getAllMessages, listUploads, setUploadKind,
  *   createEmailCode, getEmailCode, deleteEmailCode, bumpEmailCodeAttempts,
  *   getEmailCodeLastSentAt, deleteSessionsForUser,
  *   addPushSubscription, removePushSubscription, getPushSubscriptions
@@ -283,6 +283,14 @@ function removeUpload(id) {
     save();
   }
 }
+/** ضبط نوع ملف مرفوع (kind): 'attachment' للرفع العادي و'avatar' عندما يُعيَّن
+ *  صورةً شخصية — تستخدمه لوحة البيانات لتصنيف ملفات كل مستخدم في مجلدات. */
+function setUploadKind(id, kind) {
+  if (db.uploads[id] && db.uploads[id].kind !== kind) {
+    db.uploads[id].kind = kind;
+    save();
+  }
+}
 /** تعليم ملف كمُحتجَز للمالك (retained): يُضبط عندما تُحذف رسالته لدى الجميع —
  *  يبقى الملف على القرص لكن تقديمه يصبح مقيّداً بجلسة المالك فقط. */
 function markUploadRetained(id) {
@@ -327,6 +335,7 @@ module.exports = {
   addUpload,
   getUpload,
   removeUpload,
+  setUploadKind,
   markUploadRetained,
   listAllUsers,
   getAllMessages,

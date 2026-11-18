@@ -247,6 +247,9 @@ app.post('/api/me/avatar', requireAuth, (req, res) => {
   }
   req.user.avatarFileId = fileId;
   store.saveUser();
+  // يُعلَّم سجل الرفع نفسه كنوع «صورة شخصية» حتى يظهر في مجلد الصور الشخصية
+  // بلوحة البيانات لا في مجلد الصور العادية.
+  store.setUploadKind(fileId, 'avatar');
   res.json({ user: selfUser(req.user) });
 });
 
@@ -623,6 +626,39 @@ function adminMessage(m) {
   return out;
 }
 
+// ---------- تصنيف ملفات المستخدم لمجلدات لوحة البيانات ----------
+// الفئات: audio (صوت) / photos (صور) / videos (فيديوهات) / avatars (صور شخصية).
+// سجل الرفع الجديد يحمل kind صريحاً ('avatar' عند تعيينه صورةً شخصية،
+// و'attachment' للرفع العادي). السجلات القديمة بلا kind: ملف الصورة الشخصية
+// الحالية لمالكه يُعدّ صورةً شخصية، وما عداه يُصنَّف بنوع mime.
+function uploadMimeCategory(mime) {
+  const m = String(mime || '');
+  if (m.startsWith('audio/')) return 'audio';
+  if (m.startsWith('video/')) return 'videos';
+  return 'photos'; // أنواع الرفع المسموحة صور/فيديو/صوت فقط — الصور هي الافتراضي
+}
+function uploadCategory(u) {
+  if (u.kind === 'avatar') return 'avatars';
+  if (u.kind !== 'attachment') {
+    const owner = store.getUserById(u.ownerId);
+    if (owner && owner.avatarFileId && owner.avatarFileId === u.id) return 'avatars';
+  }
+  return uploadMimeCategory(u.mime);
+}
+/** عدّادات ملفات مستخدم واحد لمجلداته: رسائله المُرسَلة + ملفاته بكل فئة
+ *  (تشمل الملفات المُحتجَزة المحذوفة لدى الجميع). */
+function userCounts(userId, allUploads, allMessages) {
+  const counts = { messages: 0, audio: 0, photos: 0, videos: 0, avatars: 0, totalFiles: 0, totalBytes: 0 };
+  for (const m of allMessages) if (m.fromId === userId) counts.messages += 1;
+  for (const u of allUploads) {
+    if (u.ownerId !== userId) continue;
+    counts[uploadCategory(u)] += 1;
+    counts.totalFiles += 1;
+    counts.totalBytes += u.size || 0;
+  }
+  return counts;
+}
+
 app.get('/api/admin/overview', requireAdmin, (req, res) => {
   const uploads = store.listUploads();
   res.json({
@@ -634,8 +670,17 @@ app.get('/api/admin/overview', requireAdmin, (req, res) => {
 });
 
 app.get('/api/admin/users', requireAdmin, (req, res) => {
+  const allUploads = store.listUploads();
+  const allMessages = store.getAllMessages();
   const users = store.listAllUsers()
-    .map((u) => ({ username: u.username, avatar: store.avatarUrl(u), online: isUserOnline(u.id), createdAt: u.createdAt, email: u.emailVerified && u.email ? u.email : null }))
+    .map((u) => ({
+      username: u.username,
+      avatar: store.avatarUrl(u),
+      online: isUserOnline(u.id),
+      createdAt: u.createdAt,
+      email: u.emailVerified && u.email ? u.email : null,
+      counts: userCounts(u.id, allUploads, allMessages),
+    }))
     .sort((a, b) => a.username.localeCompare(b.username));
   res.json({ users });
 });
@@ -693,6 +738,48 @@ app.get('/api/admin/uploads', requireAdmin, (req, res) => {
   res.json({ uploads });
 });
 
+// ملفات مستخدم واحد داخل فئة من مجلدات لوحته — الأحدث أولاً. كل عنصر يحمل
+// رابطه القابل للفتح بجلسة المالك، وشريك المحادثة عندما يُستدلّ عليه من رسالة
+// تشير إلى هذا الملف (يُحذف الحقل بهدوء عند تعذّر الاستدلال، كالصور الشخصية).
+app.get('/api/admin/users/:username/files', requireAdmin, (req, res) => {
+  const user = store.getUserByUsername(String(req.params.username));
+  if (!user) return res.status(404).json({ error: 'المستخدم غير موجود' });
+  const category = String(req.query.category || 'all');
+  if (!['all', 'audio', 'photos', 'videos', 'avatars'].includes(category)) {
+    return res.status(400).json({ error: 'تصنيف غير صالح' });
+  }
+  // أول رسالة تشير إلى كل ملف — لاستخراج شريك المحادثة وحالة الحذف لدى الجميع
+  const refByFile = new Map();
+  for (const m of store.getAllMessages()) {
+    if (m.fileId && !refByFile.has(m.fileId)) refByFile.set(m.fileId, m);
+  }
+  const files = store.listUploads()
+    .filter((u) => u.ownerId === user.id)
+    .map((u) => ({ ...u, category: uploadCategory(u) }))
+    .filter((u) => category === 'all' || u.category === category)
+    .sort((x, y) => (y.ts || 0) - (x.ts || 0))
+    .map((u) => {
+      const ref = refByFile.get(u.id);
+      const item = {
+        id: u.id,
+        url: '/files/' + u.id,
+        name: u.name || null,
+        mime: u.mime,
+        size: u.size,
+        createdAt: u.ts || null,
+        category: u.category,
+        retained: !!u.retained,
+        deleted: !!u.retained || !!(ref && ref.deleted),
+      };
+      if (ref) {
+        const other = store.getUserById(ref.fromId === user.id ? ref.toId : ref.fromId);
+        if (other) item.partner = other.username;
+      }
+      return item;
+    });
+  res.json({ username: user.username, category, files });
+});
+
 // ---------- رفع الملفات وتقديمها ----------
 // الجسم الخام كما هو (حتى 100MB) — تُحفظ البايتات الأصلية دون أي معالجة.
 app.post('/api/upload', requireAuth, express.raw({ type: () => true, limit: '100mb' }), (req, res) => {
@@ -708,7 +795,7 @@ app.post('/api/upload', requireAuth, express.raw({ type: () => true, limit: '100
   const rawName = String(req.headers['x-file-name'] || '');
   let name = rawName;
   try { name = decodeURIComponent(rawName); } catch {}
-  store.addUpload(id, { file: fileName, mime, size: buf.length, name: name.slice(0, 200), ownerId: req.user.id, ts: Date.now() });
+  store.addUpload(id, { file: fileName, mime, size: buf.length, name: name.slice(0, 200), ownerId: req.user.id, ts: Date.now(), kind: 'attachment' });
   res.status(201).json({ fileId: id, url: '/files/' + id, mime, size: buf.length });
 });
 
