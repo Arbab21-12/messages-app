@@ -1196,7 +1196,7 @@ function callDurationSeconds() {
 // إعدادات الإشعارات والأصوات — تُحفَظ محلياً في هذا المتصفح تحت مفتاح rasaeli_notify
 const NOTIFY_SETTINGS_KEY = 'rasaeli_notify';
 const notifySettings = (() => {
-  const defaults = { enabled: false, messageSound: true, callAlert: 'ringtone' };
+  const defaults = { enabled: false, messageSound: true, callAlert: 'ringtone', enhanceCalls: true };
   try { return { ...defaults, ...(JSON.parse(localStorage.getItem(NOTIFY_SETTINGS_KEY) || '{}') || {}) }; }
   catch { return { ...defaults }; }
 })();
@@ -1352,6 +1352,7 @@ function showCallOverlay(mode) {
   $('call-error').hidden = true;
   $('call-mute').classList.remove('off');
   $('call-mute').textContent = '🎤 كتم';
+  updateHqBadge();
   updateCameraBtn();
   updateSpeakerBtn();
   if (mode === 'outgoing') $('call-status').textContent = 'جارٍ الاتصال…';
@@ -1364,6 +1365,7 @@ function teardownCallMedia() {
   if (call.ringTimeout) clearTimeout(call.ringTimeout);
   if (call.timer) clearInterval(call.timer);
   if (call.pc) { try { call.pc.close(); } catch {} }
+  stopCallAudioChains();
   if (call.localStream) call.localStream.getTracks().forEach((t) => t.stop());
 }
 function cleanupCall() {
@@ -1396,6 +1398,236 @@ function startCallTimer() {
   call.timer = setInterval(() => {
     if (call) $('call-status').textContent = fmtCallDuration(callDurationSeconds());
   }, 500);
+}
+
+// ----- تحسين جودة صوت المكالمات (v1.10.0) -----
+// سلسلتا معالجة WebAudio (إرسال/استقبال) + ضبط Opus — كل خطوة ملفوفة بحماية:
+// أي فشل في أي جزء يعيدنا للسلوك العادي تماماً، فلا يتعطّل أي اتصال بسبب التحسين.
+function callEnhanceOn() {
+  try { return notifySettings.enhanceCalls !== false; } catch { return false; }
+}
+// قيود التقاط صوت المكالمات عند التفعيل (إلغاء صدى + كبح ضجيج + كسب تلقائي + 48kHz)
+const CALL_AUDIO_CONSTRAINTS = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+  sampleRate: { ideal: 48000 },
+  channelCount: { ideal: 1 },
+};
+function callAudioConstraints() { return callEnhanceOn() ? CALL_AUDIO_CONSTRAINTS : true; }
+
+// __TUNE_OPUS_SDP_BEGIN__
+/** ضبط Opus داخل SDP: دمج معاملات (minptime/useinbandfec/usedtx/maxaveragebitrate)
+ *  في سطر fmtp الخاص بحمولة opus فقط، دون تكرار أي مفتاح موجود ودون لمس بقية
+ *  الأسطر. عند أي خطأ أو غياب opus يُعاد النص الأصلي كما هو دون تغيير. */
+function tuneOpusSdp(sdp) {
+  try {
+    if (typeof sdp !== 'string' || !sdp) return sdp;
+    const lines = sdp.split('\n');
+    let pt = null;
+    let rtpmapIdx = -1;
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].replace(/\r$/, '').match(/^a=rtpmap:(\d+)\s+opus\/48000/i);
+      if (m) { pt = m[1]; rtpmapIdx = i; break; }
+    }
+    if (pt === null) return sdp;
+    const fmtpRe = new RegExp('^a=fmtp:' + pt + '\\s+(.*)$');
+    let fmtpIdx = -1;
+    for (let i = 0; i < lines.length; i++) {
+      if (fmtpRe.test(lines[i].replace(/\r$/, ''))) { fmtpIdx = i; break; }
+    }
+    const wanted = [['minptime', '10'], ['useinbandfec', '1'], ['usedtx', '0'], ['maxaveragebitrate', '510000']];
+    if (fmtpIdx >= 0) {
+      const raw = lines[fmtpIdx];
+      const cr = raw.endsWith('\r') ? '\r' : '';
+      const mm = raw.replace(/\r$/, '').match(fmtpRe);
+      const params = (mm[1] || '').split(';').map((s) => s.trim()).filter(Boolean);
+      const keys = new Set(params.map((p) => p.split('=')[0].trim().toLowerCase()));
+      for (const [k, v] of wanted) if (!keys.has(k)) params.push(k + '=' + v);
+      lines[fmtpIdx] = 'a=fmtp:' + pt + ' ' + params.join(';') + cr;
+    } else {
+      const cr = lines[rtpmapIdx].endsWith('\r') ? '\r' : '';
+      lines.splice(rtpmapIdx + 1, 0, 'a=fmtp:' + pt + ' ' + wanted.map(([k, v]) => k + '=' + v).join(';') + cr);
+    }
+    return lines.join('\n');
+  } catch { return sdp; }
+}
+// __TUNE_OPUS_SDP_END__
+
+/** رفع سقف معدل بت مرسِل الصوت إلى 128kbps (يُدمج في المعاملات الحالية). */
+function tuneAudioSender(sender) {
+  if (!sender || !sender.track || sender.track.kind !== 'audio') return;
+  try {
+    const params = sender.getParameters() || {};
+    const existing = (params.encodings && params.encodings[0]) || {};
+    params.encodings = [{ ...existing, maxBitrate: 128000 }];
+    const p = sender.setParameters(params);
+    if (p && p.catch) p.catch(() => {});
+  } catch {}
+}
+
+/** هدم سلسلة معالجة: إيقاف المؤقّت وفصل العقد وإيقاف مسار الخرج المُنشأ. */
+function destroyAudioChain(chain) {
+  if (!chain) return;
+  if (chain.interval) { try { clearInterval(chain.interval); } catch {} chain.interval = null; }
+  if (chain.nodes) chain.nodes.forEach((n) => { try { n.disconnect(); } catch {} });
+  if (chain.stream) chain.stream.getTracks().forEach((t) => { try { t.stop(); } catch {} });
+}
+
+/** سلسلة الإرسال: ميكروفوننا ← مرشح علوي 90Hz ← ضاغط ← بوابة ضجيج ← خرج نظيف.
+ *  بوابة الضجيج: محلّل يلتقط إشارة الميكروفون؛ كل ~50ms نحسب RMS — فوق 0.015
+ *  تُفتح البوابة (كسب 1)، وتحت العتبة لـ~300ms متواصلة تنحدر إلى 0.05 بسلاسة. */
+function buildTxChain(rawStream) {
+  const ctx = ensureAudioCtx();
+  if (!ctx || typeof ctx.createMediaStreamSource !== 'function') return null;
+  if (!rawStream.getAudioTracks().length) return null;
+  const source = ctx.createMediaStreamSource(rawStream);
+  const highpass = ctx.createBiquadFilter();
+  highpass.type = 'highpass';
+  highpass.frequency.value = 90;
+  const comp = ctx.createDynamicsCompressor();
+  comp.threshold.value = -18;
+  comp.ratio.value = 3;
+  comp.attack.value = 0.01;
+  comp.release.value = 0.25;
+  const gate = ctx.createGain();
+  gate.gain.value = 1; // مفتوحة عند البدء حتى لا يُقصّ أول الكلام
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 512;
+  const dest = ctx.createMediaStreamDestination();
+  source.connect(highpass);
+  highpass.connect(comp);
+  comp.connect(gate);
+  gate.connect(dest);
+  source.connect(analyser); // نقطة التقاط للتحليل فقط (لا خرج مسموعاً)
+  const buf = new Uint8Array(analyser.fftSize);
+  let belowSince = null;
+  const interval = setInterval(() => {
+    try {
+      analyser.getByteTimeDomainData(buf);
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v; }
+      const rms = Math.sqrt(sum / buf.length);
+      const now = performance.now();
+      if (rms > 0.015) {
+        belowSince = null;
+        gate.gain.setTargetAtTime(1, ctx.currentTime, 0.03);
+      } else if (belowSince === null) {
+        belowSince = now;
+      } else if (now - belowSince >= 300) {
+        gate.gain.setTargetAtTime(0.05, ctx.currentTime, 0.08);
+      }
+    } catch {}
+  }, 50);
+  return { stream: dest.stream, nodes: [source, highpass, comp, gate, analyser, dest], interval };
+}
+
+/** سلسلة الاستقبال: صوت الطرف الآخر ← مرشح علوي 80Hz ← معادل وضوح (+3dB عند
+ *  3kHz) ← ضاغط ← كسب ← خرج نظيف يُشغَّل عبر عنصر الصوت/الفيديو المعتاد. */
+function buildRxChain(track) {
+  const ctx = ensureAudioCtx();
+  if (!ctx || typeof ctx.createMediaStreamSource !== 'function' || !track) return null;
+  const source = ctx.createMediaStreamSource(new MediaStream([track]));
+  const highpass = ctx.createBiquadFilter();
+  highpass.type = 'highpass';
+  highpass.frequency.value = 80;
+  const peak = ctx.createBiquadFilter();
+  peak.type = 'peaking';
+  peak.frequency.value = 3000;
+  peak.Q.value = 0.8;
+  peak.gain.value = 3;
+  const comp = ctx.createDynamicsCompressor();
+  comp.threshold.value = -20;
+  comp.ratio.value = 4;
+  const gain = ctx.createGain();
+  gain.gain.value = 1;
+  const dest = ctx.createMediaStreamDestination();
+  source.connect(highpass);
+  highpass.connect(peak);
+  peak.connect(comp);
+  comp.connect(gain);
+  gain.connect(dest);
+  return { stream: dest.stream, nodes: [source, highpass, peak, comp, gain, dest], interval: null };
+}
+
+/** شارة «صوت عالي الجودة»: تظهر أثناء المكالمة فقط عند نجاح أي جزء من التحسين. */
+function updateHqBadge() {
+  const badge = $('call-hq-badge');
+  if (!badge) return;
+  badge.hidden = !(call && (call.txEnhanced || call.rxEnhanced || call.opusTuned));
+}
+
+/** معالجة صوت وارد: بناء سلسلة الاستقبال ودمج خرجها في بث التشغيل الموحّد.
+ *  يُبقى البث الخام مشغَّلاً في عنصر صامت خفي — بعض المتصفحات لا تزوّد WebAudio
+ *  بعينات مسار بعيد ما لم يُسحب عبر عنصر وسائط. عند أي فشل نرجع false فيسلك
+ *  الكود مساره العادي بالبث الخام. */
+function handleEnhancedRemoteAudio(track, rawStream) {
+  try {
+    const chain = buildRxChain(track);
+    if (!chain) return false;
+    const processed = chain.stream.getAudioTracks()[0];
+    if (!processed) { destroyAudioChain(chain); return false; }
+    if (call.rxChain) destroyAudioChain(call.rxChain);
+    call.rxChain = chain;
+    if (!call.rxPullEl) {
+      const el = document.createElement('audio');
+      el.muted = true;
+      el.autoplay = true;
+      el.setAttribute('playsinline', '');
+      el.style.display = 'none';
+      $('call-overlay').appendChild(el);
+      call.rxPullEl = el;
+    }
+    try { call.rxPullEl.srcObject = rawStream; } catch {}
+    if (!call.playbackStream) call.playbackStream = new MediaStream();
+    call.playbackStream.getAudioTracks().forEach((t) => call.playbackStream.removeTrack(t));
+    call.playbackStream.addTrack(processed);
+    call.rxEnhanced = true;
+    if (call.type === 'video') $('remote-video').srcObject = call.playbackStream;
+    else $('remote-audio').srcObject = call.playbackStream;
+    updateHqBadge();
+    return true;
+  } catch { return false; }
+}
+
+/** دمج مسار فيديو وارد في بث التشغيل الموحّد: مع التحسين قد يصل الصوت (محسّناً
+ *  أو خاماً) في بث منفصل عن بث الفيديو، فنجمعهما في بث واحد لعنصر الفيديو. */
+function mergeRemoteVideoTrack(track) {
+  if (!call.playbackStream) call.playbackStream = new MediaStream();
+  const pb = call.playbackStream;
+  if (!pb.getAudioTracks().length) {
+    const cur = $('remote-audio').srcObject;
+    if (cur && cur !== pb) cur.getAudioTracks().forEach((t) => pb.addTrack(t));
+  }
+  pb.getVideoTracks().forEach((t) => pb.removeTrack(t));
+  pb.addTrack(track);
+  $('remote-video').srcObject = pb;
+}
+
+/** دمج مسار صوت خام وارد (عند فشل سلسلة التحسين) مع الفيديو الجاري في وضع
+ *  الفيديو، بدل استبدال بث الفيديو ببث الصوت المنفصل. */
+function mergeRemoteAudioTrackRaw(track) {
+  if (!call.playbackStream) call.playbackStream = new MediaStream();
+  const pb = call.playbackStream;
+  const cur = $('remote-video').srcObject;
+  if (cur && cur !== pb) cur.getVideoTracks().forEach((t) => { if (!pb.getVideoTracks().includes(t)) pb.addTrack(t); });
+  pb.getAudioTracks().forEach((t) => pb.removeTrack(t));
+  pb.addTrack(track);
+  $('remote-video').srcObject = pb;
+}
+
+/** إيقاف سلسلتي التحسين وعنصر السحب عند انتهاء المكالمة (من مسار الهدم القائم). */
+function stopCallAudioChains() {
+  if (!call) return;
+  destroyAudioChain(call.txChain); call.txChain = null;
+  destroyAudioChain(call.rxChain); call.rxChain = null;
+  if (call.rxPullEl) {
+    try { call.rxPullEl.srcObject = null; call.rxPullEl.remove(); } catch {}
+    call.rxPullEl = null;
+  }
+  call.playbackStream = null;
+  const badge = $('call-hq-badge');
+  if (badge) badge.hidden = true;
 }
 
 // ----- اتصال WebRTC -----
@@ -1454,16 +1686,49 @@ async function negotiate() {
   try {
     call.makingOffer = true;
     const offer = await call.pc.createOffer();
-    await call.pc.setLocalDescription(offer);
+    let desc = offer;
+    if (callEnhanceOn()) {
+      // ضبط Opus (FEC + سقف بت مرتفع) — عند أي خلل نستخدم العرض الأصلي كما هو
+      try {
+        const tuned = tuneOpusSdp(offer.sdp);
+        if (tuned && tuned !== offer.sdp) {
+          desc = { type: offer.type, sdp: tuned };
+          call.opusTuned = true;
+          updateHqBadge();
+        }
+      } catch {}
+    }
+    await call.pc.setLocalDescription(desc);
     if (call && call.pc) callSend({ type: 'call_offer', to: call.peer, sdp: call.pc.localDescription });
   } catch {} finally { if (call) call.makingOffer = false; }
 }
 function setupPeerConnection() {
   const pc = new RTCPeerConnection(ICE_CONFIG);
   call.pc = pc;
-  for (const track of call.localStream.getTracks()) pc.addTrack(track, call.localStream);
+  // تحسين الإرسال: يمرّ صوت الميكروفون عبر سلسلة المعالجة قبل إضافته للاتصال
+  // (مسار الفيديو يمرّ كما هو دون لمس). عند فشل بناء السلسلة يُضاف المسار الخام.
+  call.txChain = null;
+  let txAudioTrack = null;
+  if (callEnhanceOn()) {
+    try {
+      const chain = buildTxChain(call.localStream);
+      if (chain && chain.stream.getAudioTracks().length) {
+        call.txChain = chain;
+        txAudioTrack = chain.stream.getAudioTracks()[0];
+        call.txEnhanced = true;
+      } else if (chain) {
+        destroyAudioChain(chain);
+      }
+    } catch {}
+  }
+  for (const track of call.localStream.getTracks()) {
+    if (track.kind === 'audio' && txAudioTrack) pc.addTrack(txAudioTrack, call.txChain.stream);
+    else pc.addTrack(track, call.localStream);
+  }
   // رفع جودة الإرسال لأي مسار فيديو محلي (تلميح تفاصيل + حد بت أعلى)
   for (const sender of pc.getSenders()) tuneVideoSender(sender);
+  if (callEnhanceOn()) for (const sender of pc.getSenders()) tuneAudioSender(sender);
+  updateHqBadge();
   if (call.type === 'video') $('local-video').srcObject = call.localStream;
   pc.onicecandidate = (e) => {
     if (e.candidate && call) callSend({ type: 'call_ice', to: call.peer, candidate: e.candidate.toJSON() });
@@ -1471,10 +1736,25 @@ function setupPeerConnection() {
   pc.ontrack = (e) => {
     if (!call) return;
     const stream = e.streams[0];
+    if (callEnhanceOn() && e.track && e.track.kind === 'audio') {
+      // صوت وارد مع التحسين: يُشغَّل عبر سلسلة الاستقبال؛ عند فشلها ندمجه خاماً
+      // (في وضع الفيديو ندمجه مع الفيديو الجاري بدل استبداله ببث الصوت المنفصل)
+      if (handleEnhancedRemoteAudio(e.track, stream)) { applyAudioOutput(false); return; }
+      if (call.type === 'video') mergeRemoteAudioTrackRaw(e.track);
+      else $('remote-audio').srcObject = stream;
+      applyAudioOutput(false);
+      return;
+    }
     if (e.track && e.track.kind === 'video') {
-      // وصل مسار فيديو من الطرف الآخر (مكالمة فيديو، أو ترقية أثناء مكالمة صوتية)
-      $('remote-video').srcObject = stream;
-      switchToVideoMode();
+      if (callEnhanceOn()) {
+        // دمج الفيديو في بث التشغيل الموحّد الذي يحمل الصوت (المحسّن أو الخام)
+        mergeRemoteVideoTrack(e.track);
+        switchToVideoMode();
+      } else {
+        // وصل مسار فيديو من الطرف الآخر (مكالمة فيديو، أو ترقية أثناء مكالمة صوتية)
+        $('remote-video').srcObject = stream;
+        switchToVideoMode();
+      }
     } else if (call.type === 'video') {
       // فيديو: الصوت والصورة عبر عنصر الفيديو
       $('remote-video').srcObject = stream;
@@ -1489,6 +1769,8 @@ function setupPeerConnection() {
     if (pc.connectionState === 'connected' && !call.connectedAt) {
       call.connectedAt = Date.now();
       startCallTimer();
+      // إعادة تطبيق سقف بت الصوت بعد قيام الاتصال (بعض المتصفحات ترفضه قبلها)
+      if (callEnhanceOn()) for (const sender of pc.getSenders()) tuneAudioSender(sender);
     } else if ((pc.connectionState === 'failed' || pc.connectionState === 'disconnected') && call.status === 'active' && call.connectedAt) {
       callSend({ type: 'call_end', to: call.peer, duration: callDurationSeconds() });
       endCallWithMessage('انقطع الاتصال');
@@ -1505,9 +1787,10 @@ function flushPendingIce() {
 async function startCall(type) {
   if (call || !currentChat) return;
   const peer = currentChat;
+  ensureAudioCtx(); // استئناف سياق الصوت ضمن إيماءة البدء — تحتاجه سلاسل التحسين
   let stream;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: type === 'video' ? VIDEO_CONSTRAINTS : false });
+    stream = await navigator.mediaDevices.getUserMedia({ audio: callAudioConstraints(), video: type === 'video' ? VIDEO_CONSTRAINTS : false });
   } catch {
     alert('تعذّر الوصول إلى ' + (type === 'video' ? 'الكاميرا والميكروفون' : 'الميكروفون') + '. تحقّق من أذونات المتصفح ثم حاول مرة أخرى.');
     return;
@@ -1619,9 +1902,10 @@ $('call-accept').onclick = async () => {
   if (!call || call.status !== 'incoming') return;
   stopRingtone();
   if (call.ringTimeout) clearTimeout(call.ringTimeout);
+  ensureAudioCtx(); // استئناف سياق الصوت ضمن إيماءة القبول — تحتاجه سلاسل التحسين
   let stream;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: call.type === 'video' ? VIDEO_CONSTRAINTS : false });
+    stream = await navigator.mediaDevices.getUserMedia({ audio: callAudioConstraints(), video: call.type === 'video' ? VIDEO_CONSTRAINTS : false });
   } catch {
     callSend({ type: 'call_reject', to: call.peer });
     $('call-error').textContent = 'تعذّر الوصول إلى الميكروفون/الكاميرا — أُنهيت المكالمة. تحقّق من أذونات المتصفح.';
@@ -1828,6 +2112,7 @@ async function disableNotifications() {
 function syncNotifyUi() {
   $('notify-enabled').checked = !!notifySettings.enabled;
   $('notify-msg-sound').checked = !!notifySettings.messageSound;
+  $('notify-enhance-calls').checked = notifySettings.enhanceCalls !== false;
   $('notify-call-alert').value = notifySettings.callAlert;
   if (!$('notify-status').textContent) {
     setNotifyStatus(notifySettings.enabled ? 'الإشعارات مفعّلة' : 'الإشعارات متوقفة');
@@ -1845,6 +2130,10 @@ $('notify-msg-sound').addEventListener('change', (e) => {
 });
 $('notify-call-alert').addEventListener('change', (e) => {
   notifySettings.callAlert = e.target.value;
+  saveNotifySettings();
+});
+$('notify-enhance-calls').addEventListener('change', (e) => {
+  notifySettings.enhanceCalls = e.target.checked;
   saveNotifySettings();
 });
 $('notify-test-ring').onclick = () => {

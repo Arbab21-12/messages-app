@@ -237,6 +237,10 @@
         <span>صوت الرسائل</span>
         <input id="notify-msg-sound" type="checkbox" checked>
       </label>
+      <label class="switch-row">
+        <span>🎧 تحسين جودة صوت المكالمات</span>
+        <input id="notify-enhance-calls" type="checkbox" checked>
+      </label>
       <label class="profile-label" for="notify-call-alert">تنبيه الاتصال</label>
       <select id="notify-call-alert">
         <option value="ringtone">نغمة رنين</option>
@@ -251,7 +255,7 @@
     </div>
     <hr class="profile-sep">
     <p class="hint privacy-note">حماية الخصوصية: نمنع حفظ الصور من داخل التطبيق ونخفي المحتوى عند تبديل التطبيقات. ملاحظة: لا يمكن لأي موقع ويب منع لقطات شاشة نظام التشغيل منعاً كاملاً — الحظر الكامل يحتاج نسخة التطبيق الأصلية (أندرويد/آيفون)</p>
-    <p class="hint version-line">الإصدار 1.9.0</p>
+    <p class="hint version-line">الإصدار 1.10.0</p>
   </div>
 </div>
 
@@ -292,6 +296,7 @@
     <div id="call-avatar" class="call-avatar">؟</div>
     <div id="call-peer-name" class="call-peer-name"></div>
     <div id="call-status" class="call-status"></div>
+    <div id="call-hq-badge" class="call-hq-badge" hidden>🎧 صوت عالي الجودة</div>
   </div>
   <p id="call-error" class="error" hidden></p>
   <div id="call-incoming-actions" class="call-actions" hidden>
