@@ -343,6 +343,12 @@ function connectWs() {
         appendMessage(m);
         if (m.from === currentChat) markRead(m.from);
       }
+      // تنبيه محلي: رسالة من شخص آخر (ليست سجل مكالمة) وصلت والصفحة مخفية أو
+      // محادثته ليست المفتوحة — إشعار باسم المرسل + صوت رسالة إن كان مفعّلاً
+      if (m.from !== me.username && m.kind !== 'call' && (document.hidden || currentChat !== other)) {
+        showLocalNotification(m.from, 'رسالة جديدة');
+        if (notifySettings.messageSound) messageBeep();
+      }
       loadConversations();
     }
     if (data.type === 'message_deleted') {
@@ -848,8 +854,6 @@ const ICE_CONFIG = {
 };
 const RING_TIMEOUT_MS = 30000;
 let call = null; // { peer, type, role, status, pc, localStream, connectedAt, acceptedAt, timer, ringTimeout, pendingIce }
-let ringCtx = null;
-let ringInterval = null;
 
 function callSend(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
@@ -864,38 +868,150 @@ function callDurationSeconds() {
   return start ? Math.round((Date.now() - start) / 1000) : 0;
 }
 
-// ----- نغمة الرنين (WebAudio — بدون أي ملف خارجي) -----
-function startRingtone() {
-  stopRingtone();
+// ----- الإشعارات والأصوات (WebAudio + SpeechSynthesis — بدون ملفات وبدون موسيقى) -----
+// إعدادات الإشعارات والأصوات — تُحفَظ محلياً في هذا المتصفح تحت مفتاح rasaeli_notify
+const NOTIFY_SETTINGS_KEY = 'rasaeli_notify';
+const notifySettings = (() => {
+  const defaults = { enabled: false, messageSound: true, callAlert: 'ringtone' };
+  try { return { ...defaults, ...(JSON.parse(localStorage.getItem(NOTIFY_SETTINGS_KEY) || '{}') || {}) }; }
+  catch { return { ...defaults }; }
+})();
+function saveNotifySettings() {
+  try { localStorage.setItem(NOTIFY_SETTINGS_KEY, JSON.stringify(notifySettings)); } catch {}
+}
+
+// عامل الخدمة: يُسجَّل عند تحميل الصفحة (لعرض الإشعارات واستقبال Push)
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(() => {});
+}
+
+// سياق صوت واحد مشترك — يُنشأ/يُستأنف عند أول لمسة (سياسات منع التشغيل التلقائي)
+let audioCtx = null;
+function ensureAudioCtx() {
+  if (!audioCtx) {
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch { audioCtx = null; }
+  }
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+  return audioCtx;
+}
+document.addEventListener('pointerdown', () => { ensureAudioCtx(); }, { once: true });
+
+// صوت رسالة جديدة: صفيرتان جيبيتان قصيرتان (880 هرتز لـ 0.09ث، ثم 1320 هرتز لـ 0.12ث)
+function messageBeep() {
+  const ctx = ensureAudioCtx();
+  if (!ctx) return;
   try {
-    ringCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const beep = () => {
-      if (!ringCtx) return;
-      const t = ringCtx.currentTime;
-      for (const off of [0, 0.35]) {
-        const osc = ringCtx.createOscillator();
-        const gain = ringCtx.createGain();
-        osc.type = 'sine';
-        osc.frequency.value = 880;
-        gain.gain.setValueAtTime(0.0001, t + off);
-        gain.gain.exponentialRampToValueAtTime(0.15, t + off + 0.03);
-        gain.gain.exponentialRampToValueAtTime(0.0001, t + off + 0.3);
-        osc.connect(gain);
-        gain.connect(ringCtx.destination);
-        osc.start(t + off);
-        osc.stop(t + off + 0.32);
-      }
+    const tone = (freq, startAt, dur) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, startAt);
+      gain.gain.exponentialRampToValueAtTime(0.12, startAt + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, startAt + dur);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(startAt);
+      osc.stop(startAt + dur + 0.02);
     };
-    if (ringCtx.state === 'suspended') ringCtx.resume().catch(() => {});
-    beep();
-    ringInterval = setInterval(beep, 2000);
+    const t = ctx.currentTime;
+    tone(880, t, 0.09);
+    tone(1320, t + 0.11, 0.12);
   } catch {}
 }
-function stopRingtone() {
-  if (ringInterval) { clearInterval(ringInterval); ringInterval = null; }
-  if (ringCtx) { ringCtx.close().catch(() => {}); ringCtx = null; }
+
+// نغمة هاتف كلاسيكية: مجموع موجتين جيبيتين 440 + 480 هرتز — دفقة ثانيتين ثم
+// ٤ ثوانٍ صمت، تتكرر كل ٦ ثوانٍ ما دام الرنين جارياً.
+let ringNodes = null;      // { oscs, gain } — عقد الدفقة الجارية
+let ringOffTimer = null;   // مؤقّت إنهاء الدفقة الجارية
+let ringCycleTimer = null; // مؤقّت تكرار الدفقات
+function ringBurst() {
+  const ctx = ensureAudioCtx();
+  if (!ctx) return;
+  stopRingBurst();
+  try {
+    const t = ctx.currentTime;
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(0.07, t + 0.04);
+    gain.gain.setValueAtTime(0.07, t + 1.92);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + 2.0);
+    gain.connect(ctx.destination);
+    const oscs = [440, 480].map((freq) => {
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      osc.connect(gain);
+      osc.start(t);
+      osc.stop(t + 2.05);
+      return osc;
+    });
+    ringNodes = { oscs, gain };
+    ringOffTimer = setTimeout(stopRingBurst, 2150);
+  } catch {}
+}
+function stopRingBurst() {
+  if (ringOffTimer) { clearTimeout(ringOffTimer); ringOffTimer = null; }
+  if (ringNodes) {
+    const nodes = ringNodes;
+    ringNodes = null;
+    try {
+      nodes.oscs.forEach((o) => { try { o.stop(); } catch {} });
+      nodes.gain.disconnect();
+    } catch {}
+  }
+}
+
+// نطق اسم المتصل: جملة عربية («يتصل بك {name}») ثم جملة إنجليزية
+// («{name} is calling you») — وتتكرر الجملتان كل ٦ ثوانٍ أثناء الرنين.
+let voiceTimer = null;
+function announceCaller(name) {
+  if (!('speechSynthesis' in window)) return false;
+  try {
+    const ar = new SpeechSynthesisUtterance(`يتصل بك ${name}`);
+    ar.lang = 'ar-SA';
+    const en = new SpeechSynthesisUtterance(`${name} is calling you`);
+    en.lang = 'en-US';
+    speechSynthesis.speak(ar);
+    speechSynthesis.speak(en);
+    return true;
+  } catch { return false; }
+}
+function startVoiceAnnounce(name) {
+  stopVoiceAnnounce();
+  if (!announceCaller(name)) return false;
+  voiceTimer = setInterval(() => { announceCaller(name); }, 6000);
+  return true;
+}
+function stopVoiceAnnounce() {
+  if (voiceTimer) { clearInterval(voiceTimer); voiceTimer = null; }
+  if ('speechSynthesis' in window) { try { speechSynthesis.cancel(); } catch {} }
+}
+
+// بدء تنبيه المكالمة الواردة حسب وضع «تنبيه الاتصال» المضبوط، وإيقافه كاملاً
+// (النغمة + النطق + الاهتزاز). عند تعذّر النطق نرجع للنغمة تلقائياً.
+function startRing() {
+  stopRing();
+  const mode = notifySettings.callAlert;
+  if (mode === 'silent') return;
+  let voiceOk = false;
+  if (mode === 'voice' || mode === 'both') {
+    voiceOk = startVoiceAnnounce(call ? call.peer : '');
+  }
+  if (mode === 'ringtone' || mode === 'both' || !voiceOk) {
+    ringBurst();
+    ringCycleTimer = setInterval(ringBurst, 6000);
+  }
+}
+function stopRing() {
+  if (ringCycleTimer) { clearInterval(ringCycleTimer); ringCycleTimer = null; }
+  stopRingBurst();
+  stopVoiceAnnounce();
   if (navigator.vibrate) navigator.vibrate(0);
 }
+// أسماء النغمة السابقة تبقى واجهةً لنفس المحرك — دورة حياة المكالمة تستدعيها كما هي
+function startRingtone() { startRing(); }
+function stopRingtone() { stopRing(); }
 
 // ----- واجهة المكالمة -----
 function showCallOverlay(mode) {
@@ -1108,6 +1224,7 @@ function handleCallEvent(data) {
       };
       showCallOverlay('incoming');
       startRingtone();
+      showLocalNotification(`مكالمة واردة من ${data.from}`, call.type === 'video' ? 'مكالمة فيديو واردة' : 'مكالمة صوتية واردة');
       if (navigator.vibrate) navigator.vibrate([400, 200, 400, 200, 400]);
       call.ringTimeout = setTimeout(() => {
         if (call && call.status === 'incoming') cleanupCall(); // توقف الرنين دون رد
@@ -1298,6 +1415,123 @@ $('call-speaker').onclick = () => {
   applyAudioOutput(true);
 };
 
+// ---------- الإشعارات: عرض محلي + اشتراك Push + عناصر قسم «الإشعارات والأصوات» ----------
+/** إشعار محلي فوري (أثناء عمل التطبيق): عبر عامل الخدمة مفضّلاً، وإلا Notification. */
+async function showLocalNotification(title, body) {
+  if (!notifySettings.enabled) return;
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  try {
+    if ('serviceWorker' in navigator) {
+      const reg = await navigator.serviceWorker.getRegistration();
+      if (reg && typeof reg.showNotification === 'function') {
+        await reg.showNotification(title, { body: body || '', icon: '/icon.svg' });
+        return;
+      }
+    }
+  } catch {}
+  try { new Notification(title, { body: body || '', icon: '/icon.svg' }); } catch {}
+}
+
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(base64);
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+function setNotifyStatus(msg) {
+  const el = $('notify-status');
+  if (el) el.textContent = msg;
+}
+
+async function enableNotifications() {
+  if (!('Notification' in window)) {
+    notifySettings.enabled = false;
+    saveNotifySettings();
+    setNotifyStatus('هذا المتصفح لا يدعم الإشعارات');
+    return;
+  }
+  let perm = Notification.permission;
+  if (perm === 'default') { try { perm = await Notification.requestPermission(); } catch {} }
+  if (perm !== 'granted') {
+    notifySettings.enabled = false;
+    saveNotifySettings();
+    setNotifyStatus('لم يُمنح إذن الإشعارات — فعّله من إعدادات المتصفح/الهاتف ثم أعد المحاولة');
+    return;
+  }
+  notifySettings.enabled = true;
+  saveNotifySettings();
+  // اشتراك Push لتصل الإشعارات والتطبيق مغلق تماماً — يحتاج مفتاح VAPID على
+  // الخادم ودعم PushManager؛ عند غياب أيٍّ منهما تبقى الإشعارات المحلية وحدها.
+  try {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) throw new Error('push unsupported');
+    const { publicKey } = await api('/api/push/public-key');
+    const reg = await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) {
+      sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(publicKey),
+      });
+    }
+    await api('/api/push/subscribe', {
+      method: 'POST',
+      body: JSON.stringify({ subscription: sub.toJSON ? sub.toJSON() : sub }),
+    });
+    setNotifyStatus('الإشعارات مفعّلة — ستصلك الرسائل والمكالمات حتى والتطبيق مغلق');
+  } catch {
+    setNotifyStatus('الإشعارات مفعّلة على هذا الجهاز — إشعارات الخلفية (والتطبيق مغلق) غير مفعّلة على الخادم بعد');
+  }
+}
+async function disableNotifications() {
+  notifySettings.enabled = false;
+  saveNotifySettings();
+  try {
+    if ('serviceWorker' in navigator) {
+      const reg = await navigator.serviceWorker.getRegistration();
+      const sub = reg ? await reg.pushManager.getSubscription() : null;
+      if (sub) {
+        const endpoint = sub.endpoint;
+        try { await sub.unsubscribe(); } catch {}
+        try { await api('/api/push/unsubscribe', { method: 'POST', body: JSON.stringify({ endpoint }) }); } catch {}
+      }
+    }
+  } catch {}
+  setNotifyStatus('الإشعارات متوقفة');
+}
+function syncNotifyUi() {
+  $('notify-enabled').checked = !!notifySettings.enabled;
+  $('notify-msg-sound').checked = !!notifySettings.messageSound;
+  $('notify-call-alert').value = notifySettings.callAlert;
+  if (!$('notify-status').textContent) {
+    setNotifyStatus(notifySettings.enabled ? 'الإشعارات مفعّلة' : 'الإشعارات متوقفة');
+  }
+}
+$('notify-enabled').addEventListener('change', async (e) => {
+  if (e.target.checked) await enableNotifications();
+  else await disableNotifications();
+  syncNotifyUi();
+});
+$('notify-msg-sound').addEventListener('change', (e) => {
+  notifySettings.messageSound = e.target.checked;
+  saveNotifySettings();
+  if (e.target.checked) messageBeep(); // تجربة فورية للصوت
+});
+$('notify-call-alert').addEventListener('change', (e) => {
+  notifySettings.callAlert = e.target.value;
+  saveNotifySettings();
+});
+$('notify-test-ring').onclick = () => {
+  if (call && call.status === 'incoming') return; // لا نعبث بتنبيه مكالمة واردة جارية
+  ensureAudioCtx();
+  ringBurst(); // دفقة ثانيتين
+  setTimeout(stopRingBurst, 3000); // إيقاف مؤكد بعد ~٣ ثوانٍ
+};
+$('notify-test-voice').onclick = () => {
+  if (!announceCaller('أحمد')) setNotifyStatus('النطق غير متاح في هذا المتصفح');
+};
+
 // ---------- الملف الشخصي: الصورة الشخصية + تغيير اسم المستخدم ----------
 function openProfile() {
   if (!me) return;
@@ -1307,6 +1541,7 @@ function openProfile() {
   $('profile-error').hidden = true;
   $('profile-ok').hidden = true;
   syncEmailSection();
+  syncNotifyUi();
   $('pw-current').value = '';
   $('pw-new').value = '';
   $('pw-confirm').value = '';

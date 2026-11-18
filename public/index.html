@@ -191,7 +191,33 @@
       <p id="pw-ok" class="ok" hidden></p>
     </form>
     <hr class="profile-sep">
+    <div id="notify-section">
+      <span class="profile-label">🔔 الإشعارات والأصوات</span>
+      <label class="switch-row">
+        <span>تفعيل الإشعارات</span>
+        <input id="notify-enabled" type="checkbox">
+      </label>
+      <p id="notify-status" class="hint"></p>
+      <p class="hint">على آيفون: أضف التطبيق إلى الشاشة الرئيسية أولاً لتصلك الإشعارات والتطبيق مغلق</p>
+      <label class="switch-row">
+        <span>صوت الرسائل</span>
+        <input id="notify-msg-sound" type="checkbox" checked>
+      </label>
+      <label class="profile-label" for="notify-call-alert">تنبيه الاتصال</label>
+      <select id="notify-call-alert">
+        <option value="ringtone">نغمة رنين</option>
+        <option value="voice">نطق اسم المتصل</option>
+        <option value="both">النغمة + النطق</option>
+        <option value="silent">صامت</option>
+      </select>
+      <div class="notify-test-row">
+        <button id="notify-test-ring" type="button" class="ghost">تجربة النغمة</button>
+        <button id="notify-test-voice" type="button" class="ghost">تجربة النطق</button>
+      </div>
+    </div>
+    <hr class="profile-sep">
     <p class="hint privacy-note">حماية الخصوصية: نمنع حفظ الصور من داخل التطبيق ونخفي المحتوى عند تبديل التطبيقات. ملاحظة: لا يمكن لأي موقع ويب منع لقطات شاشة نظام التشغيل منعاً كاملاً — الحظر الكامل يحتاج نسخة التطبيق الأصلية (أندرويد/آيفون)</p>
+    <p class="hint version-line">الإصدار 1.7.0</p>
   </div>
 </div>
 
