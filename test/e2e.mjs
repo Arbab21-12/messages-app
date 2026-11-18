@@ -21,9 +21,15 @@
 // التخزين الفعلي في data.json وحدّ ٥ اشتراكات، والتقاط حمولة «رسالة» بلا أي
 // نص من الرسالة وحمولة «مكالمة» لمستخدم غير متصل مشترك، وغياب الالتقاط
 // عند الاتصال أو بعد إلغاء الاشتراك)، وتعطّل نقاط Push بـ 503 على الخادم
-// الرئيسي بلا مفاتيح VAPID.
+// الرئيسي بلا مفاتيح VAPID، ومجلدات لوحة البيانات: تصنيف ملفات كل مستخدم
+// (صور/تسجيلات/فيديوهات/صور شخصية) وعدّادات /api/admin/users ونقطة
+// /api/admin/users/:username/files (الفئات منفصلة، الصورة الشخصية ليست في
+// الصور، الملف المُحتجَز المحذوف لدى الجميع داخل العدّادات، ورفض غير المالك)،
+// والتصنيف الاحتياطي للسجلات القديمة بلا kind على خادم سابع ببيانات مزروعة
+// (ملف الصورة الشخصية الحالية يُعدّ صورةً شخصية وما عداه بنوع mime).
 // التشغيل: npm test
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -526,6 +532,155 @@ try {
   check('ملف غير مُحتجَز: retained غير مضبوط ويبقى متاحاً علناً (200)',
     !!plainRow2 && !plainRow2.retained && plainStillPublic.status === 200,
     `retained=${plainRow2?.retained} status=${plainStillPublic.status}`);
+
+  // 22) مجلدات لوحة البيانات: تصنيف ملفات مستخدم واحد في فئات (صور/تسجيلات/
+  // فيديوهات/صور شخصية) + عدّادات /api/admin/users + نقطة ملفات الفئة.
+  const regFold = await api('/api/register', { method: 'POST', body: { username: 'fold_user', password: 'Fold1234!' } });
+  const regFoldPeer = await api('/api/register', { method: 'POST', body: { username: 'fold_peer', password: 'Fold1234!' } });
+  check('تسجيل fold_user و fold_peer (اختبار المجلدات)', regFold.status === 201 && regFoldPeer.status === 201,
+    `user=${regFold.status} peer=${regFoldPeer.status}`);
+  const tokFold = regFold.data.token;
+  const MP4_BYTES = Buffer.from('FAKE_MP4_VIDEO_BYTES');
+  const VOICE_BYTES = Buffer.from('FAKE_WEBM_AUDIO_BYTES');
+  const fUpPhoto = await uploadRaw(PNG_BYTES, { token: tokFold, mime: 'image/png', name: 'fold-photo.png' });
+  const fUpVideo = await uploadRaw(MP4_BYTES, { token: tokFold, mime: 'video/mp4', name: 'fold-video.mp4' });
+  const fUpVoice1 = await uploadRaw(VOICE_BYTES, { token: tokFold, mime: 'audio/webm', name: 'fold-voice1.webm' });
+  const fUpVoice2 = await uploadRaw(VOICE_BYTES, { token: tokFold, mime: 'audio/webm', name: 'fold-voice2.webm' });
+  const fUpPhoto2 = await uploadRaw(PNG_BYTES, { token: tokFold, mime: 'image/png', name: 'fold-photo2.png' });
+  const fUpAvatar = await uploadRaw(PNG_BYTES, { token: tokFold, mime: 'image/png', name: 'fold-avatar.png' });
+  check('fold_user يرفع ٦ ملفات بأنواع مختلفة',
+    [fUpPhoto, fUpVideo, fUpVoice1, fUpVoice2, fUpPhoto2, fUpAvatar].every((u) => u.status === 201 && !!u.data.fileId),
+    `statuses=${[fUpPhoto, fUpVideo, fUpVoice1, fUpVoice2, fUpPhoto2, fUpAvatar].map((u) => u.status).join(',')}`);
+  const fSetAvatar = await api('/api/me/avatar', { method: 'POST', token: tokFold, body: { fileId: fUpAvatar.data.fileId } });
+  check('fold_user يعيّن صورته الشخصية', fSetAvatar.status === 200, `status=${fSetAvatar.status}`);
+  const fMsgText = await api('/api/messages/fold_peer', { method: 'POST', token: tokFold, body: { text: 'رسالة اختبار المجلدات' } });
+  const fMsgPhoto = await api('/api/messages/fold_peer', { method: 'POST', token: tokFold, body: { kind: 'image', fileId: fUpPhoto.data.fileId } });
+  const fMsgVoice = await api('/api/messages/fold_peer', { method: 'POST', token: tokFold, body: { kind: 'voice', fileId: fUpVoice1.data.fileId, durationSec: 3 } });
+  const fMsgVideo = await api('/api/messages/fold_peer', { method: 'POST', token: tokFold, body: { kind: 'video', fileId: fUpVideo.data.fileId } });
+  const fMsgPhoto2 = await api('/api/messages/fold_peer', { method: 'POST', token: tokFold, body: { kind: 'image', fileId: fUpPhoto2.data.fileId } });
+  check('fold_user يرسل ٥ رسائل (نص/صورة/صوت/فيديو/صورة)',
+    [fMsgText, fMsgPhoto, fMsgVoice, fMsgVideo, fMsgPhoto2].every((m) => m.status === 201),
+    `statuses=${[fMsgText, fMsgPhoto, fMsgVoice, fMsgVideo, fMsgPhoto2].map((m) => m.status).join(',')}`);
+  const fDelPhoto2 = await api('/api/messages/' + fMsgPhoto2.data.message?.id, { method: 'DELETE', token: tokFold, body: { scope: 'everyone' } });
+  check('fold_user يحذف رسالة الصورة الثانية لدى الجميع (ملفها يصبح مُحتجَزاً)', fDelPhoto2.status === 200, `status=${fDelPhoto2.status}`);
+  // العدّادات: ٥ رسائل مُرسَلة، صورتان (إحداهما مُحتجَزة)، فيديو، تسجيلان، صورة شخصية
+  const usersFold = await api('/api/admin/users', { token: tokAdmin });
+  const foldRow = usersFold.data.users?.find((u) => u.username === 'fold_user');
+  const foldBytes = PNG_BYTES.length * 3 + MP4_BYTES.length + VOICE_BYTES.length * 2;
+  check('عدّادات fold_user في /api/admin/users دقيقة وتشمل الملف المُحتجَز',
+    !!foldRow && foldRow.counts?.messages === 5 && foldRow.counts?.photos === 2 && foldRow.counts?.videos === 1 &&
+    foldRow.counts?.audio === 2 && foldRow.counts?.avatars === 1 && foldRow.counts?.totalFiles === 6 &&
+    foldRow.counts?.totalBytes === foldBytes,
+    JSON.stringify(foldRow?.counts || {}));
+  // نقطة الفئات: فصل دقيق بين الفئات + الشريك + الاحتجاز
+  const foldFiles = (cat) => api('/api/admin/users/fold_user/files?category=' + cat, { token: tokAdmin });
+  const filesPhotos = await foldFiles('photos');
+  const retItem = filesPhotos.data.files?.find((f) => f.id === fUpPhoto2.data.fileId);
+  check('مجلد الصور: صورتان فقط — المُحتجَزة بينهما مع retained/deleted وشريكها، وبلا الصورة الشخصية',
+    filesPhotos.status === 200 && filesPhotos.data.files?.length === 2 &&
+    filesPhotos.data.files.some((f) => f.id === fUpPhoto.data.fileId && f.partner === 'fold_peer' && f.retained === false) &&
+    !!retItem && retItem.retained === true && retItem.deleted === true && retItem.partner === 'fold_peer' &&
+    !filesPhotos.data.files.some((f) => f.id === fUpAvatar.data.fileId),
+    JSON.stringify(filesPhotos.data.files || {}));
+  const retViaAdmin = retItem ? await getFileRaw(retItem.url + '?t=' + encodeURIComponent(tokAdmin)) : { status: 0 };
+  check('رابط الملف المُحتجَز القادم من نقطة المجلدات يفتح بجلسة المالك (200)',
+    retViaAdmin.status === 200 && retViaAdmin.buf.equals(PNG_BYTES), `status=${retViaAdmin.status}`);
+  const filesAudio = await foldFiles('audio');
+  check('مجلد التسجيلات: تسجيلان — المُرسَل بشريكه والمرفوع فقط بلا حقل شريك',
+    filesAudio.status === 200 && filesAudio.data.files?.length === 2 &&
+    filesAudio.data.files.some((f) => f.id === fUpVoice1.data.fileId && f.partner === 'fold_peer') &&
+    filesAudio.data.files.some((f) => f.id === fUpVoice2.data.fileId && !('partner' in f)),
+    JSON.stringify(filesAudio.data.files || {}));
+  const filesVideos = await foldFiles('videos');
+  check('مجلد الفيديوهات: الفيديو الوحيد فقط بشريكه',
+    filesVideos.status === 200 && filesVideos.data.files?.length === 1 &&
+    filesVideos.data.files[0].id === fUpVideo.data.fileId && filesVideos.data.files[0].partner === 'fold_peer',
+    JSON.stringify(filesVideos.data.files || {}));
+  const filesAvatars = await foldFiles('avatars');
+  check('مجلد الصور الشخصية: الصورة الشخصية وحدها (لا تظهر في الصور)',
+    filesAvatars.status === 200 && filesAvatars.data.files?.length === 1 &&
+    filesAvatars.data.files[0].id === fUpAvatar.data.fileId && filesAvatars.data.files[0].category === 'avatars',
+    JSON.stringify(filesAvatars.data.files || {}));
+  const filesAll = await foldFiles('all');
+  check('مجلد كل الملفات: ٦ ملفات مرتبة من الأحدث إلى الأقدم',
+    filesAll.status === 200 && filesAll.data.files?.length === 6 &&
+    filesAll.data.files.every((f, i, arr) => i === 0 || (arr[i - 1].createdAt || 0) >= (f.createdAt || 0)),
+    `count=${filesAll.data.files?.length}`);
+  const filesForbidden = await api('/api/admin/users/fold_user/files?category=photos', { token: tokFold });
+  check('نقطة ملفات المجلدات محرّمة على غير المالك (403)', filesForbidden.status === 403, `status=${filesForbidden.status}`);
+  const filesAnon = await api('/api/admin/users/fold_user/files?category=photos');
+  check('نقطة ملفات المجلدات بلا جلسة تُرفض (401)', filesAnon.status === 401, `status=${filesAnon.status}`);
+  const filesGhost = await api('/api/admin/users/no_such_user/files?category=photos', { token: tokAdmin });
+  check('ملفات مستخدم غير موجود تُرجع 404', filesGhost.status === 404, `status=${filesGhost.status}`);
+  const filesBadCat = await api('/api/admin/users/fold_user/files?category=bogus', { token: tokAdmin });
+  check('تصنيف غير صالح يُرجع 400', filesBadCat.status === 400, `status=${filesBadCat.status}`);
+
+  // 23) التصنيف الاحتياطي للسجلات القديمة بلا kind — خادم سابع ببيانات مزروعة:
+  // ملف الصورة الشخصية الحالية لمالكه يُعدّ صورةً شخصية، وما عداه بنوع mime.
+  const dataDir7 = fs.mkdtempSync(path.join(os.tmpdir(), 'msgtest7-'));
+  const server7 = (() => {
+    fs.mkdirSync(path.join(dataDir7, 'uploads'), { recursive: true });
+    const salt7 = crypto.randomBytes(16).toString('hex');
+    const hash7 = crypto.scryptSync('Legacy1234!', salt7, 64).toString('hex');
+    const legacyId = crypto.randomUUID();
+    const AVATAR_ID7 = 'a'.repeat(32);
+    const PHOTO_ID7 = 'b'.repeat(32);
+    fs.writeFileSync(path.join(dataDir7, 'uploads', AVATAR_ID7 + '.png'), PNG_BYTES);
+    fs.writeFileSync(path.join(dataDir7, 'uploads', PHOTO_ID7 + '.png'), PNG_BYTES);
+    fs.writeFileSync(path.join(dataDir7, 'data.json'), JSON.stringify({
+      users: [{ id: legacyId, username: 'legacy_admin', salt: salt7, hash: hash7, createdAt: Date.now(), avatarFileId: AVATAR_ID7 }],
+      messages: [], sessions: {}, nameReservations: [], emailCodes: [], emailCodeSentAt: {},
+      uploads: {
+        [AVATAR_ID7]: { file: AVATAR_ID7 + '.png', mime: 'image/png', size: PNG_BYTES.length, name: 'old-avatar.png', ownerId: legacyId, ts: Date.now() - 2000 },
+        [PHOTO_ID7]: { file: PHOTO_ID7 + '.png', mime: 'image/png', size: PNG_BYTES.length, name: 'old-photo.png', ownerId: legacyId, ts: Date.now() - 1000 },
+      },
+    }));
+    const s = spawn('node', ['server.js'], {
+      cwd: root,
+      env: {
+        ...process.env, PORT: '3225', DATA_DIR: dataDir7, ADMIN_USERNAME: 'legacy_admin',
+        MAIL_OUTBOX: '', SMTP_USER: '', SMTP_PASS: '', BREVO_API_KEY: '', MAILJET_API_KEY: '', MAILJET_API_SECRET: '', SMTP2GO_API_KEY: '',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    s.stderr.on('data', (d) => process.stderr.write('[server7] ' + d));
+    return s;
+  })();
+  try {
+    const BASE7 = 'http://localhost:3225';
+    const api7 = async (p, { method = 'GET', token, body } = {}) => {
+      const res = await fetch(BASE7 + p, {
+        method,
+        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: res.status, data: await res.json().catch(() => ({})) };
+    };
+    let up7 = false;
+    for (let i = 0; i < 50 && !up7; i++) {
+      try { const r = await fetch(BASE7 + '/api/health'); up7 = r.ok; } catch { await wait(200); }
+    }
+    check('الخادم السابع (بيانات قديمة مزروعة) أقلع', up7);
+    const login7 = await api7('/api/login', { method: 'POST', body: { username: 'legacy_admin', password: 'Legacy1234!' } });
+    check('دخول legacy_admin على الخادم السابع', login7.status === 200 && !!login7.data.token, `status=${login7.status}`);
+    const tok7 = login7.data.token;
+    const av7 = await api7('/api/admin/users/legacy_admin/files?category=avatars', { token: tok7 });
+    check('سجل قديم بلا kind: ملف الصورة الشخصية الحالية يُصنَّف في الصور الشخصية',
+      av7.status === 200 && av7.data.files?.length === 1 && av7.data.files[0].id === 'a'.repeat(32),
+      JSON.stringify(av7.data.files || {}));
+    const ph7 = await api7('/api/admin/users/legacy_admin/files?category=photos', { token: tok7 });
+    check('سجل قديم بلا kind: الصورة العادية تبقى في الصور ولا تتسرب إلى الشخصية',
+      ph7.status === 200 && ph7.data.files?.length === 1 && ph7.data.files[0].id === 'b'.repeat(32),
+      JSON.stringify(ph7.data.files || {}));
+    const users7 = await api7('/api/admin/users', { token: tok7 });
+    const row7 = users7.data.users?.find((u) => u.username === 'legacy_admin');
+    check('عدّادات legacy_admin تعكس التصنيف الاحتياطي (شخصية ١، صور ١، الكل ٢)',
+      row7?.counts?.avatars === 1 && row7?.counts?.photos === 1 && row7?.counts?.totalFiles === 2,
+      JSON.stringify(row7?.counts || {}));
+  } finally {
+    server7.kill();
+    fs.rmSync(dataDir7, { recursive: true, force: true });
+  }
 
   // 17) أمان الحساب: تغيير كلمة المرور + ربط بريد مؤكد برمز + استعادة بالبريد
   const regSec = await api('/api/register', { method: 'POST', body: { username: 'sec_user', password: 'Secu1234!' } });
