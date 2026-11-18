@@ -127,20 +127,36 @@
     <span></span>
   </header>
   <div class="view admin-view">
-    <p id="admin-overview" class="admin-overview">جارٍ التحميل…</p>
-    <h3>المستخدمون</h3>
-    <ul id="admin-users" class="list"></ul>
-    <h3>المحادثات</h3>
-    <ul id="admin-conversations" class="list"></ul>
+    <div id="admin-home">
+      <p id="admin-overview" class="admin-overview">جارٍ التحميل…</p>
+      <h3>المستخدمون</h3>
+      <ul id="admin-users" class="list"></ul>
+      <h3>المحادثات</h3>
+      <ul id="admin-conversations" class="list"></ul>
+      <h3>📁 ملفات المستخدمين</h3>
+      <ul id="admin-folders" class="list"></ul>
+    </div>
+    <div id="admin-user-folder" hidden>
+      <div class="admin-crumb">
+        <button id="admin-folder-back" type="button" class="ghost">→ رجوع</button>
+        <strong id="admin-folder-title"></strong>
+      </div>
+      <div id="admin-folder-grid" class="admin-folder-grid"></div>
+    </div>
+    <div id="admin-category" hidden>
+      <div class="admin-crumb">
+        <button id="admin-category-back" type="button" class="ghost">→ رجوع</button>
+        <strong id="admin-category-title"></strong>
+      </div>
+      <div id="admin-category-body"></div>
+    </div>
     <div id="admin-thread" hidden>
       <div class="admin-thread-head">
         <strong id="admin-thread-title"></strong>
-        <button id="admin-thread-close" type="button" class="ghost">إغلاق</button>
+        <button id="admin-thread-close" type="button" class="ghost">→ رجوع</button>
       </div>
       <div id="admin-messages" class="messages admin-messages"></div>
     </div>
-    <h3>الملفات المرفوعة</h3>
-    <div id="admin-uploads" class="admin-uploads"></div>
   </div>
 </section>
 
@@ -217,7 +233,7 @@
     </div>
     <hr class="profile-sep">
     <p class="hint privacy-note">حماية الخصوصية: نمنع حفظ الصور من داخل التطبيق ونخفي المحتوى عند تبديل التطبيقات. ملاحظة: لا يمكن لأي موقع ويب منع لقطات شاشة نظام التشغيل منعاً كاملاً — الحظر الكامل يحتاج نسخة التطبيق الأصلية (أندرويد/آيفون)</p>
-    <p class="hint version-line">الإصدار 1.7.0</p>
+    <p class="hint version-line">الإصدار 1.8.0</p>
   </div>
 </div>
 

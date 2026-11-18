@@ -1716,25 +1716,40 @@ function fmtBytes(n) {
 }
 $('admin-btn').onclick = openAdmin;
 $('admin-back').onclick = () => show('main-screen');
-$('admin-thread-close').onclick = () => { $('admin-thread').hidden = true; };
+// تنقّل اللوحة بالمستويات: رئيسية ← مجلد مستخدم ← فئة/محادثات ← سجل محادثة.
+// زر رجوع السجل يعود لما فُتح منه (فئة محادثات المستخدم أو القائمة العامة).
+let adminUsersData = []; // آخر /api/admin/users (مع عدّادات المجلدات)
+let adminConvsData = [];  // آخر /api/admin/conversations
+const adminNav = { level: 'home', username: null, category: null, threadReturn: 'home' };
+function adminShow(level) {
+  adminNav.level = level;
+  $('admin-home').hidden = level !== 'home';
+  $('admin-user-folder').hidden = level !== 'folder';
+  $('admin-category').hidden = level !== 'category';
+  $('admin-thread').hidden = level !== 'thread';
+}
+$('admin-folder-back').onclick = () => adminShow('home');
+$('admin-category-back').onclick = () => adminShow('folder');
+$('admin-thread-close').onclick = () => adminShow(adminNav.threadReturn === 'category' ? 'category' : 'home');
 
 async function openAdmin() {
   if (!me || !me.isAdmin) return;
   show('admin-screen');
-  $('admin-thread').hidden = true;
+  adminShow('home');
   try {
-    const [ov, us, cv, up] = await Promise.all([
+    const [ov, us, cv] = await Promise.all([
       api('/api/admin/overview'),
       api('/api/admin/users'),
       api('/api/admin/conversations'),
-      api('/api/admin/uploads'),
     ]);
+    adminUsersData = us.users || [];
+    adminConvsData = cv.conversations || [];
     $('admin-overview').textContent =
       `المستخدمون: ${ov.users} · الرسائل: ${ov.messages} · الملفات المرفوعة: ${ov.uploads} · الحجم الكلي: ${fmtBytes(ov.uploadBytes)}`;
     // المستخدمون
     const ulist = $('admin-users');
     ulist.innerHTML = '';
-    for (const u of us.users || []) {
+    for (const u of adminUsersData) {
       const li = document.createElement('li');
       li.innerHTML = `
         ${avatarHtml(u.username, u.avatar)}
@@ -1748,27 +1763,40 @@ async function openAdmin() {
     // المحادثات
     const clist = $('admin-conversations');
     clist.innerHTML = '';
-    for (const c of cv.conversations || []) {
+    for (const c of adminConvsData) {
+      clist.appendChild(adminConversationRow(c, 'home'));
+    }
+    // 📁 ملفات المستخدمين: صفّ مجلد لكل مستخدم بعدّاد ملفاته وحجمه الكلي
+    const flist = $('admin-folders');
+    flist.innerHTML = '';
+    for (const u of adminUsersData) {
+      const counts = u.counts || {};
       const li = document.createElement('li');
       li.innerHTML = `
+        ${avatarHtml(u.username, u.avatar)}
         <div class="row-main">
-          <div class="row-title"><span>${escapeHtml(c.a)} ↔ ${escapeHtml(c.b)}</span><time>${c.lastAt ? fmtTime(c.lastAt) : ''}</time></div>
-          <div class="row-sub">${c.count} رسالة · ${escapeHtml(c.lastText || '')}</div>
+          <div class="row-title"><span>📁 ${escapeHtml(u.username)}</span></div>
+          <div class="row-sub">${counts.totalFiles || 0} ملف · ${fmtBytes(counts.totalBytes || 0)}</div>
         </div>`;
-      li.onclick = () => openAdminThread(c.a, c.b);
-      clist.appendChild(li);
+      li.onclick = () => openUserFolder(u.username);
+      flist.appendChild(li);
     }
-    // الملفات المرفوعة
-    const grid = $('admin-uploads');
-    grid.innerHTML = '';
-    for (const u of up.uploads || []) {
-      grid.appendChild(adminUploadItem(u));
-    }
-    if (!(up.uploads || []).length) grid.innerHTML = '<p class="empty">لا ملفات مرفوعة بعد</p>';
+    if (!adminUsersData.length) flist.innerHTML = '<p class="empty">لا مستخدمين بعد</p>';
   } catch (err) {
     alert(err.message || 'فشل تحميل لوحة البيانات');
     show('main-screen');
   }
+}
+/** صفّ محادثة في لوحة البيانات — ret: أين يعود زر رجوع السجل ('home' أو 'category'). */
+function adminConversationRow(c, ret) {
+  const li = document.createElement('li');
+  li.innerHTML = `
+    <div class="row-main">
+      <div class="row-title"><span>${escapeHtml(c.a)} ↔ ${escapeHtml(c.b)}</span><time>${c.lastAt ? fmtTime(c.lastAt) : ''}</time></div>
+      <div class="row-sub">${c.count} رسالة · ${escapeHtml(c.lastText || '')}</div>
+    </div>`;
+  li.onclick = () => openAdminThread(c.a, c.b, ret);
+  return li;
 }
 /** رابط ملف في لوحة البيانات: الملفات المُحتجَزة (محذوفة لدى الجميع) لا تُفتح
  *  إلا برمز جلسة المالك في الاستعلام ?t= — وغيرها يبقى رابطها العادي. */
@@ -1776,32 +1804,119 @@ function adminFileUrl(url, retained) {
   if (!url) return url;
   return retained ? url + '?t=' + encodeURIComponent(token || '') : url;
 }
-function adminUploadItem(u) {
+// ---------- مجلدات المستخدمين في لوحة البيانات ----------
+const ADMIN_FOLDERS = [
+  { key: 'messages', icon: '💬', label: 'الرسائل والمحادثات' },
+  { key: 'audio', icon: '🎤', label: 'التسجيلات الصوتية' },
+  { key: 'photos', icon: '🖼', label: 'الصور' },
+  { key: 'videos', icon: '🎬', label: 'الفيديوهات' },
+  { key: 'avatars', icon: '👤', label: 'الصور الشخصية' },
+  { key: 'all', icon: '📦', label: 'كل الملفات' },
+];
+function fmtDateTime(ts) {
+  if (!ts) return '';
+  return new Date(ts).toLocaleDateString('ar-EG') + ' · ' + fmtTime(ts);
+}
+/** فتح مجلد مستخدم: بطاقات فئاته بعدّاداتها (أو «فارغ»). */
+function openUserFolder(username) {
+  const u = adminUsersData.find((x) => x.username === username);
+  if (!u) return;
+  adminNav.username = username;
+  adminNav.category = null;
+  $('admin-folder-title').textContent = `لوحة البيانات ← ${username}`;
+  const counts = u.counts || {};
+  const convCount = adminConvsData.filter((c) => c.a === username || c.b === username).length;
+  const grid = $('admin-folder-grid');
+  grid.innerHTML = '';
+  for (const f of ADMIN_FOLDERS) {
+    const n = f.key === 'messages' ? convCount
+      : f.key === 'all' ? (counts.totalFiles || 0)
+      : (counts[f.key] || 0);
+    const card = document.createElement('button');
+    card.type = 'button';
+    card.className = 'admin-folder-card';
+    card.innerHTML = `
+      <span class="folder-icon">${f.icon}</span>
+      <span class="folder-label">${f.label}</span>
+      <span class="folder-count">${n ? (f.key === 'messages' ? `${n} محادثة` : `${n} ملف`) : 'فارغ'}</span>`;
+    card.onclick = () => openAdminCategory(f.key);
+    grid.appendChild(card);
+  }
+  adminShow('folder');
+}
+/** فتح فئة داخل مجلد المستخدم الحالي: محادثاته أو ملفاته من نقطة الفئة. */
+async function openAdminCategory(key) {
+  const username = adminNav.username;
+  if (!username) return;
+  adminNav.category = key;
+  const folder = ADMIN_FOLDERS.find((f) => f.key === key);
+  $('admin-category-title').textContent = `${username} ← ${folder ? folder.label : ''}`;
+  const body = $('admin-category-body');
+  body.innerHTML = '<p class="empty">جارٍ التحميل…</p>';
+  adminShow('category');
+  if (key === 'messages') {
+    const rows = adminConvsData.filter((c) => c.a === username || c.b === username);
+    body.innerHTML = '';
+    if (!rows.length) { body.innerHTML = '<p class="empty">لا محادثات بعد</p>'; return; }
+    const ul = document.createElement('ul');
+    ul.className = 'list';
+    for (const c of rows) ul.appendChild(adminConversationRow(c, 'category'));
+    body.appendChild(ul);
+    return;
+  }
+  try {
+    const data = await api('/api/admin/users/' + encodeURIComponent(username) + '/files?category=' + encodeURIComponent(key));
+    renderAdminFiles(body, data.files || [], key);
+  } catch (err) {
+    body.innerHTML = '';
+    alert(err.message || 'فشل تحميل المجلد');
+  }
+}
+function renderAdminFiles(body, files, category) {
+  body.innerHTML = '';
+  if (!files.length) { body.innerHTML = '<p class="empty">فارغ — لا ملفات هنا بعد</p>'; return; }
+  const wrap = document.createElement('div');
+  wrap.className = (category === 'audio' || category === 'videos') ? 'admin-file-list' : 'admin-uploads';
+  for (const u of files) wrap.appendChild(adminFileCard(u));
+  body.appendChild(wrap);
+}
+/** بطاقة ملف داخل مجلد: تُعرض حسب نوعها (صورة مصغّرة / فيديو / مشغّل صوت)،
+ *  مع التاريخ والحجم وشريك المحادثة إن وُجد، ووسم «محذوفة — محفوظة» الأحمر
+ *  للملفات المُحتجَزة المحذوفة لدى الجميع. */
+function adminFileCard(u) {
   const item = document.createElement('div');
   item.className = 'admin-upload';
   const url = adminFileUrl(u.url, u.retained);
-  const badge = u.retained ? ` <span class="admin-deleted-tag">محذوفة — محفوظة للمالك</span>` : '';
-  const cap = `<div>${escapeHtml(u.owner || '؟')} · ${fmtBytes(u.size)}${badge}</div>`;
-  if ((u.mime || '').startsWith('image/')) {
+  const badge = u.retained ? ` <span class="admin-deleted-tag">محذوفة — محفوظة</span>` : '';
+  const meta = [];
+  if (u.partner) meta.push('مع ' + escapeHtml(u.partner));
+  meta.push(fmtBytes(u.size));
+  if (u.createdAt) meta.push(fmtDateTime(u.createdAt));
+  const cap = `<div>${meta.join(' · ')}${badge}</div>`;
+  const mime = u.mime || '';
+  if (mime.startsWith('image/')) {
     item.innerHTML = `<img src="${url}" alt="" draggable="false" loading="lazy">${cap}`;
     item.querySelector('img').onclick = () => openImageViewer(url);
+  } else if (mime.startsWith('video/')) {
+    item.innerHTML = `<video src="${url}" controls preload="metadata" playsinline></video>${cap}`;
+  } else if (mime.startsWith('audio/')) {
+    item.innerHTML = `<div class="admin-audio-icon">🎤</div><audio src="${url}" controls preload="metadata"></audio>${cap}`;
   } else {
-    const icon = (u.mime || '').startsWith('video/') ? '🎥' : (u.mime || '').startsWith('audio/') ? '🎤' : '📄';
-    const label = (u.mime || '').startsWith('video/') ? 'فيديو' : (u.mime || '').startsWith('audio/') ? 'صوت' : 'ملف';
-    item.innerHTML = `<a href="${url}" target="_blank" rel="noopener">${icon}<span>${label}</span></a>${cap}`;
+    item.innerHTML = `<a href="${url}" target="_blank" rel="noopener">📄<span>ملف</span></a>${cap}`;
   }
   return item;
 }
-async function openAdminThread(a, b) {
+async function openAdminThread(a, b, ret) {
   try {
     const data = await api('/api/admin/messages?a=' + encodeURIComponent(a) + '&b=' + encodeURIComponent(b));
+    adminNav.threadReturn = ret || 'home';
     $('admin-thread-title').textContent = `محادثة ${data.a} ↔ ${data.b}`;
     const box = $('admin-messages');
     box.innerHTML = '';
     for (const m of data.messages || []) box.appendChild(renderAdminMessage(m, data.a));
-    $('admin-thread').hidden = false;
+    adminShow('thread');
     box.scrollTop = box.scrollHeight;
-    $('admin-thread').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    window.scrollTo({ top: 0 });
   } catch (err) { alert(err.message || 'فشل تحميل المحادثة'); }
 }
 /** عرض رسالة في لوحة المالك (للقراءة فقط) — بنفس أشكال المحادثة. الرسالة المحذوفة
