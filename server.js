@@ -13,6 +13,10 @@ const express = require('express');
 const { WebSocketServer } = require('ws');
 const store = require('./store');
 const mailer = require('./mailer');
+// Web Push اختياري: غياب الحزمة أو مفاتيح VAPID يعطّل الإشعارات بهدوء (503)
+// دون أن يمسّ أي وظيفة أخرى في الخادم.
+let webpush = null;
+try { webpush = require('web-push'); } catch { webpush = null; }
 
 const PORT = process.env.PORT || 3000;
 // اسم المستخدم: يبدأ بحرف أو رقم، ثم حروف/أرقام و _ . - — الطول الكلي 1–24
@@ -24,6 +28,52 @@ const USERNAME_TAKEN_ERROR = 'اسم المستخدم هذا مستخدم من �
 // اسم مستخدم المالك (Admin) — يُضبط من البيئة فقط. عند فراغه تُعطَّل لوحة البيانات
 // كلّياً (نقاط /api/admin/* ترجع 404). المطابقة دقيقة لحالة الأحرف.
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || '';
+
+// ---------- إشعارات Push (VAPID) ----------
+// المفاتيح من البيئة فقط. عند غيابها (أو فشل ضبطها) تُعطَّل نقاط /api/push/*
+// بـ 503 ولا يتعطّل أي شيء آخر. PUSH_TEST_CAPTURE=1 وضع اختبار فقط: تُسجَّل
+// الحمولات في DATA_DIR/push-capture.jsonl بدل الإرسال الفعلي عبر الشبكة.
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || '';
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:arbab5000000@gmail.com';
+const PUSH_TEST_CAPTURE = process.env.PUSH_TEST_CAPTURE === '1';
+const PUSH_CAPTURE_FILE = path.join(store.DATA_DIR, 'push-capture.jsonl');
+let PUSH_ENABLED = false;
+if (webpush && VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+  try {
+    webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+    PUSH_ENABLED = true;
+  } catch { PUSH_ENABLED = false; }
+}
+
+/** إرسال إشعار Push لكل اشتراكات مستخدم. لا يرمي أبداً: أي فشل (شبكة/مفتاح/
+ *  خدمة) يُبتلع بصمت حتى لا يكسر الإشعاراتُ الرسائلَ أو المكالمات. الاشتراك
+ *  الذي تردّ خدمته بـ 404/410 (انتهى/أُلغي) يُحذف من سجل المستخدم. */
+async function sendPush(userId, payload) {
+  try {
+    const subs = store.getPushSubscriptions(userId);
+    if (!subs.length) return;
+    if (PUSH_TEST_CAPTURE) {
+      // وضع الاختبار: سطر JSON واحد لكل حمولة — وبلا أي إرسال شبكي فعلي
+      try {
+        const user = store.getUserById(userId);
+        fs.appendFileSync(PUSH_CAPTURE_FILE, JSON.stringify({ userId, username: user ? user.username : null, ...payload }) + '\n', 'utf8');
+      } catch {}
+      return;
+    }
+    if (!PUSH_ENABLED) return;
+    const body = JSON.stringify(payload);
+    await Promise.all(subs.map(async (sub) => {
+      try {
+        await webpush.sendNotification(sub, body);
+      } catch (err) {
+        if (err && (err.statusCode === 404 || err.statusCode === 410)) {
+          store.removePushSubscription(userId, sub.endpoint);
+        }
+      }
+    }));
+  } catch {}
+}
 
 // قوة كلمة المرور (عند التسجيل فقط): 4 حروف على الأقل + رقم + رمز
 function passwordError(password) {
@@ -367,6 +417,44 @@ app.post('/api/password/reset', (req, res) => {
   store.saveUser();
   store.deleteEmailCode(user.id, 'reset');
   store.deleteSessionsForUser(user.id, null);
+  res.json({ ok: true });
+});
+
+// ---------- إشعارات Push: المفتاح العام والاشتراك/إلغاؤه ----------
+// كلها بمصادقة. عند غياب مفاتيح VAPID ترجع 503 (الإشعارات غير مفعّلة بعد).
+const PUSH_DISABLED_ERROR = 'إشعارات Push غير مفعّلة بعد';
+function validPushSubscription(sub) {
+  return !!sub && typeof sub === 'object'
+    && typeof sub.endpoint === 'string' && sub.endpoint.length > 0
+    && !!sub.keys && typeof sub.keys === 'object'
+    && typeof sub.keys.p256dh === 'string' && sub.keys.p256dh.length > 0
+    && typeof sub.keys.auth === 'string' && sub.keys.auth.length > 0;
+}
+
+app.get('/api/push/public-key', requireAuth, (req, res) => {
+  if (!PUSH_ENABLED) return res.status(503).json({ error: PUSH_DISABLED_ERROR });
+  res.json({ publicKey: VAPID_PUBLIC_KEY });
+});
+
+app.post('/api/push/subscribe', requireAuth, (req, res) => {
+  if (!PUSH_ENABLED) return res.status(503).json({ error: PUSH_DISABLED_ERROR });
+  const sub = (req.body || {}).subscription;
+  if (!validPushSubscription(sub)) {
+    return res.status(400).json({ error: 'اشتراك Push غير صالح' });
+  }
+  // يُحفَظ نسخة مُنقّاة فقط (endpoint + المفتاحان + انتهاء اختياري)
+  store.addPushSubscription(req.user.id, {
+    endpoint: sub.endpoint,
+    keys: { p256dh: sub.keys.p256dh, auth: sub.keys.auth },
+    expirationTime: typeof sub.expirationTime === 'number' ? sub.expirationTime : null,
+  });
+  res.json({ ok: true });
+});
+
+app.post('/api/push/unsubscribe', requireAuth, (req, res) => {
+  if (!PUSH_ENABLED) return res.status(503).json({ error: PUSH_DISABLED_ERROR });
+  const endpoint = String((req.body || {}).endpoint || '');
+  if (endpoint) store.removePushSubscription(req.user.id, endpoint);
   res.json({ ok: true });
 });
 
@@ -749,6 +837,15 @@ function deliverMessage(fromUser, toUser, payload) {
   store.addMessage(msg);
   const delivered = sendToUser(toUser.id, { type: 'message', message: publicMessage(msg) });
   if (delivered > 0) store.markDelivered(msg);
+  else {
+    // المستقبِل غير متصل الآن: إشعار Push (إن كان مشتركاً) — بلا أي نص من الرسالة
+    sendPush(toUser.id, {
+      type: 'message',
+      from: fromUser.username,
+      title: fromUser.username,
+      body: 'أرسل لك رسالة جديدة',
+    });
+  }
   // تأكيد للمرسِل بالحالة النهائية (مرسلة/تم التسليم)
   sendToUser(fromUser.id, { type: 'sent', message: publicMessage(msg) });
   return msg;
@@ -815,6 +912,13 @@ function handleCallSignal(ws, me, data) {
     const calleeOnline = connections.has(to.id) && connections.get(to.id).size > 0;
     if (!calleeOnline) {
       wsSend(ws, { type: 'call_unavailable', with: to.username });
+      // المدعو غير متصل: إشعار Push بالمكالمة الواردة (إن كان مشتركاً)
+      sendPush(to.id, {
+        type: 'call',
+        from: me.username,
+        title: me.username,
+        body: 'مكالمة واردة',
+      });
       logCallRecord(
         { callerId: me.id, calleeId: to.id, callType, logged: false },
         callLabel(callType) + ' فائتة'

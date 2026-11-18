@@ -11,7 +11,8 @@
  *   getNameReservation, addNameReservation, removeNameReservation,
  *   listAllUsers, getAllMessages, listUploads,
  *   createEmailCode, getEmailCode, deleteEmailCode, bumpEmailCodeAttempts,
- *   getEmailCodeLastSentAt, deleteSessionsForUser
+ *   getEmailCodeLastSentAt, deleteSessionsForUser,
+ *   addPushSubscription, removePushSubscription, getPushSubscriptions
  */
 const fs = require('fs');
 const path = require('path');
@@ -182,6 +183,37 @@ function getEmailCodeLastSentAt(userId, purpose) {
   return db.emailCodeSentAt[emailCodeKey(userId, purpose)] || 0;
 }
 
+// ---------- اشتراكات إشعارات Push (Web Push) ----------
+// تُحفَظ داخل سجل المستخدم نفسه (حقل pushSubscriptions) في نفس مخزن JSON الذرّي.
+// كل اشتراك: { endpoint, keys: { p256dh, auth }, expirationTime } — جهاز/متصفح واحد.
+// التفريد بنقطة النهاية (endpoint)، وبحدّ أقصى ٥ اشتراكات لكل مستخدم (الأقدم يُزاح).
+const MAX_PUSH_SUBSCRIPTIONS = 5;
+function addPushSubscription(userId, sub) {
+  const user = getUserById(userId);
+  if (!user) return null;
+  if (!Array.isArray(user.pushSubscriptions)) user.pushSubscriptions = [];
+  user.pushSubscriptions = user.pushSubscriptions.filter((s) => s && s.endpoint !== sub.endpoint);
+  user.pushSubscriptions.push(sub);
+  while (user.pushSubscriptions.length > MAX_PUSH_SUBSCRIPTIONS) user.pushSubscriptions.shift();
+  save();
+  return user.pushSubscriptions;
+}
+function removePushSubscription(userId, endpoint) {
+  const user = getUserById(userId);
+  if (!user || !Array.isArray(user.pushSubscriptions)) return false;
+  const before = user.pushSubscriptions.length;
+  user.pushSubscriptions = user.pushSubscriptions.filter((s) => s && s.endpoint !== endpoint);
+  if (user.pushSubscriptions.length !== before) {
+    save();
+    return true;
+  }
+  return false;
+}
+function getPushSubscriptions(userId) {
+  const user = getUserById(userId);
+  return user && Array.isArray(user.pushSubscriptions) ? user.pushSubscriptions.slice() : [];
+}
+
 // ---------- الرسائل ----------
 function addMessage(msg) {
   db.messages.push(msg);
@@ -280,6 +312,9 @@ module.exports = {
   deleteEmailCode,
   bumpEmailCodeAttempts,
   getEmailCodeLastSentAt,
+  addPushSubscription,
+  removePushSubscription,
+  getPushSubscriptions,
   addMessage,
   getConversation,
   getAllConversationsFor,
