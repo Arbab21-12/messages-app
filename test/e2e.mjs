@@ -15,9 +15,16 @@
 // وإرسال Mailjet عبر HTTPS API على خادم رابع يقصده وهمي محلي آخر (ترويسة
 // مصادقة Basic وحمولة Messages + مسار فشل عند ردّ 401)، وإرسال SMTP2GO عبر
 // HTTPS API على خادم خامس يقصده وهمي محلي ثالث (ترويسة X-Smtp2go-Api-Key
-// وحمولة sender/to/text_body + مسار فشل عند ردّ 400).
+// وحمولة sender/to/text_body + مسار فشل عند ردّ 400)، وإشعارات Web Push على
+// خادم سادس بمفاتيح VAPID مولّدة للاختبار ووضع الالتقاط PUSH_TEST_CAPTURE=1
+// (المفتاح العام، رفض اشتراك مشوّه 400، دورة اشتراك/إلغاء مع التحقق من
+// التخزين الفعلي في data.json وحدّ ٥ اشتراكات، والتقاط حمولة «رسالة» بلا أي
+// نص من الرسالة وحمولة «مكالمة» لمستخدم غير متصل مشترك، وغياب الالتقاط
+// عند الاتصال أو بعد إلغاء الاشتراك)، وتعطّل نقاط Push بـ 503 على الخادم
+// الرئيسي بلا مفاتيح VAPID.
 // التشغيل: npm test
 import { spawn } from 'node:child_process';
+import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -913,6 +920,183 @@ try {
     server5.kill();
     s2gMock.close();
     fs.rmSync(dataDir5, { recursive: true, force: true });
+  }
+
+  // 21) إشعارات Web Push — خادم سادس بمفاتيح VAPID مولّدة للاختبار +
+  // PUSH_TEST_CAPTURE=1: الحمولات تُسجَّل في push-capture.jsonl بدل الشبكة.
+  // الخادم الرئيسي بلا مفاتيح VAPID: نقاط Push ترجع 503 ولا يتعطل شيء آخر.
+  const pkNoVapid = await api('/api/push/public-key', { token: tokA });
+  check('بلا مفاتيح VAPID: GET /api/push/public-key يرجع 503', pkNoVapid.status === 503, `status=${pkNoVapid.status}`);
+
+  const webpushTest = createRequire(import.meta.url)('web-push');
+  const vapidKeys = webpushTest.generateVAPIDKeys();
+  const dataDir6 = fs.mkdtempSync(path.join(os.tmpdir(), 'msgtest-push-'));
+  const capturePath6 = path.join(dataDir6, 'push-capture.jsonl');
+  const server6 = spawn('node', ['server.js'], {
+    cwd: root,
+    env: {
+      ...process.env, PORT: '3224', DATA_DIR: dataDir6,
+      MAIL_OUTBOX: '', SMTP_USER: '', SMTP_PASS: '', ADMIN_USERNAME: '',
+      BREVO_API_KEY: '', MAILJET_API_KEY: '', MAILJET_API_SECRET: '', SMTP2GO_API_KEY: '',
+      VAPID_PUBLIC_KEY: vapidKeys.publicKey, VAPID_PRIVATE_KEY: vapidKeys.privateKey,
+      PUSH_TEST_CAPTURE: '1',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  server6.stderr.on('data', (d) => process.stderr.write('[server6] ' + d));
+  try {
+    const apiPush = async (p, { method = 'GET', token, body } = {}) => {
+      const res = await fetch('http://localhost:3224' + p, {
+        method,
+        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: res.status, data: await res.json().catch(() => ({})) };
+    };
+    let up6 = false;
+    for (let i = 0; i < 50 && !up6; i++) {
+      try { const r = await fetch('http://localhost:3224/api/health'); up6 = r.ok; } catch { await wait(200); }
+    }
+    check('الخادم السادس (Push) أقلع', up6);
+
+    const regPS = await apiPush('/api/register', { method: 'POST', body: { username: 'push_sender', password: 'Push1234!' } });
+    const regPR = await apiPush('/api/register', { method: 'POST', body: { username: 'push_receiver', password: 'Push1234!' } });
+    check('تسجيل push_sender و push_receiver', regPS.status === 201 && regPR.status === 201,
+      `sender=${regPS.status} receiver=${regPR.status}`);
+    const tokPS = regPS.data.token, tokPR = regPR.data.token;
+
+    const pkAnon = await apiPush('/api/push/public-key');
+    check('GET /api/push/public-key بلا مصادقة يرجع 401', pkAnon.status === 401, `status=${pkAnon.status}`);
+    const pk = await apiPush('/api/push/public-key', { token: tokPR });
+    check('GET /api/push/public-key يرجع المفتاح العام المضبوط في البيئة',
+      pk.status === 200 && pk.data.publicKey === vapidKeys.publicKey,
+      `status=${pk.status} key=${pk.data.publicKey || ''}`);
+
+    const fakeSub = (n) => ({
+      endpoint: `https://push.example.test/sub/${n}`,
+      expirationTime: null,
+      keys: { p256dh: 'BPfakeP256dhKey' + n, auth: 'fakeauth' + n },
+    });
+    const readDb6 = () => JSON.parse(fs.readFileSync(path.join(dataDir6, 'data.json'), 'utf8'));
+    const subsOf = (username) => (readDb6().users.find((u) => u.username === username) || {}).pushSubscriptions || [];
+    const readCapture6 = () => {
+      try { return fs.readFileSync(capturePath6, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)); }
+      catch { return []; }
+    };
+    const waitCapture6 = async (pred, ms = 4000) => {
+      const t0 = Date.now();
+      while (Date.now() - t0 < ms) {
+        const found = readCapture6().find(pred);
+        if (found) return found;
+        await wait(150);
+      }
+      return null;
+    };
+
+    // اشتراك مشوّه: غياب keys / نوع خاطئ / جسم فارغ → 400
+    const subBad1 = await apiPush('/api/push/subscribe', { method: 'POST', token: tokPR, body: { subscription: { endpoint: 'https://push.example.test/x' } } });
+    const subBad2 = await apiPush('/api/push/subscribe', { method: 'POST', token: tokPR, body: { subscription: 'nope' } });
+    const subBad3 = await apiPush('/api/push/subscribe', { method: 'POST', token: tokPR, body: {} });
+    check('اشتراك Push مشوّه يُرفض 400 (بكل أشكاله)',
+      subBad1.status === 400 && subBad2.status === 400 && subBad3.status === 400,
+      `s1=${subBad1.status} s2=${subBad2.status} s3=${subBad3.status}`);
+
+    // اشتراك صالح → يُحفَظ في سجل المستخدم فعلياً، والتكرار بنفس نقطة النهاية لا يضاعفه
+    const subOk = await apiPush('/api/push/subscribe', { method: 'POST', token: tokPR, body: { subscription: fakeSub(1) } });
+    check('اشتراك Push صالح ينجح (200)', subOk.status === 200 && subOk.data.ok === true, `status=${subOk.status}`);
+    check('الاشتراك محفوظ في data.json داخل سجل push_receiver',
+      subsOf('push_receiver').length === 1 && subsOf('push_receiver')[0].endpoint === fakeSub(1).endpoint &&
+      subsOf('push_receiver')[0].keys?.p256dh === fakeSub(1).keys.p256dh,
+      JSON.stringify(subsOf('push_receiver')));
+    const subDup = await apiPush('/api/push/subscribe', { method: 'POST', token: tokPR, body: { subscription: fakeSub(1) } });
+    check('إعادة الاشتراك بنفس نقطة النهاية لا تضاعف الاشتراك (تفريد)',
+      subDup.status === 200 && subsOf('push_receiver').length === 1, `count=${subsOf('push_receiver').length}`);
+
+    // رسالة إلى مشترك غير متصل → حمولة «message» ملتقطة، وبلا أي نص من الرسالة
+    const SECRET = 'نص سري للغاية 98765';
+    const msgToOffline = await apiPush('/api/messages/push_receiver', { method: 'POST', token: tokPS, body: { text: SECRET } });
+    check('push_sender يرسل رسالة إلى push_receiver غير المتصل', msgToOffline.status === 201, `status=${msgToOffline.status}`);
+    const capMsg = await waitCapture6((l) => l.type === 'message' && l.username === 'push_receiver');
+    check('التقاط Push: حمولة رسالة للمشترك غير المتصل (from/title/body كما هو مضبوط)',
+      !!capMsg && capMsg.from === 'push_sender' && capMsg.title === 'push_sender' && capMsg.body === 'أرسل لك رسالة جديدة',
+      JSON.stringify(capMsg || {}));
+    const captureRaw1 = (() => { try { return fs.readFileSync(capturePath6, 'utf8'); } catch { return ''; } })();
+    check('ملف الالتقاط لا يحتوي أي نص من الرسالة نفسها', !captureRaw1.includes('98765') && !captureRaw1.includes('نص سري'));
+
+    // دعوة مكالمة إلى مشترك غير متصل → حمولة «call» ملتقطة
+    const connectWs6 = (token) => new Promise((resolve, reject) => {
+      const ws6 = new WebSocket('ws://localhost:3224/ws');
+      const inbox6 = [];
+      const waiters6 = [];
+      ws6.on('message', (raw) => {
+        const m6 = JSON.parse(raw.toString());
+        inbox6.push(m6);
+        for (let i = waiters6.length - 1; i >= 0; i--) {
+          if (waiters6[i].pred(m6)) { waiters6[i].resolve(m6); waiters6.splice(i, 1); }
+        }
+        if (m6.type === 'authed') resolve(apiWs6);
+      });
+      ws6.on('error', reject);
+      const apiWs6 = {
+        ws: ws6, inbox: inbox6,
+        send: (o) => ws6.send(JSON.stringify(o)),
+        waitFor: (pred, ms = 5000) => new Promise((res, rej) => {
+          const f = inbox6.find(pred);
+          if (f) return res(f);
+          const w = { pred, resolve: res };
+          waiters6.push(w);
+          setTimeout(() => rej(new Error('timeout waiting for WS6 event')), ms);
+        }),
+        close: () => ws6.close(),
+      };
+      ws6.on('open', () => ws6.send(JSON.stringify({ type: 'auth', token })));
+    });
+    const PS = await connectWs6(tokPS);
+    PS.send({ type: 'call_invite', to: 'push_receiver', callType: 'voice' });
+    const unavail6 = await PS.waitFor((m) => m.type === 'call_unavailable' && m.with === 'push_receiver').catch(() => null);
+    check('المتصل يستلم call_unavailable (المدعو غير متصل)', !!unavail6);
+    const capCall = await waitCapture6((l) => l.type === 'call' && l.username === 'push_receiver');
+    check('التقاط Push: حمولة مكالمة واردة للمشترك غير المتصل',
+      !!capCall && capCall.from === 'push_sender' && capCall.title === 'push_sender' && capCall.body === 'مكالمة واردة',
+      JSON.stringify(capCall || {}));
+    PS.close();
+    await wait(300);
+
+    // مشترك متصل عبر WebSocket: الرسالة تصل لحظياً ولا يُرسل أي Push
+    const msgCapsBefore = readCapture6().filter((l) => l.type === 'message').length;
+    const PR = await connectWs6(tokPR);
+    await wait(200);
+    await apiPush('/api/messages/push_receiver', { method: 'POST', token: tokPS, body: { text: 'رسالة والمستقبل متصل' } });
+    const livePush = await PR.waitFor((m) => m.type === 'message' && m.message.text.includes('والمستقبل متصل')).catch(() => null);
+    check('المشترك المتصل يستلم الرسالة لحظياً عبر WebSocket', !!livePush);
+    await wait(500);
+    check('لا Push يُرسل ما دام المستقبِل متصلاً',
+      readCapture6().filter((l) => l.type === 'message').length === msgCapsBefore,
+      `before=${msgCapsBefore} after=${readCapture6().filter((l) => l.type === 'message').length}`);
+    PR.close();
+    await wait(400);
+
+    // إلغاء الاشتراك: يُزال من السجل، وبعده لا Push لرسائل جديدة
+    const unsub = await apiPush('/api/push/unsubscribe', { method: 'POST', token: tokPR, body: { endpoint: fakeSub(1).endpoint } });
+    check('إلغاء اشتراك Push ينجح ويُزال من data.json',
+      unsub.status === 200 && subsOf('push_receiver').length === 0,
+      `status=${unsub.status} count=${subsOf('push_receiver').length}`);
+    const capsBeforeUnsubMsg = readCapture6().length;
+    await apiPush('/api/messages/push_receiver', { method: 'POST', token: tokPS, body: { text: 'رسالة بعد إلغاء الاشتراك' } });
+    await wait(700);
+    check('بعد إلغاء الاشتراك لا يُلتقط أي Push جديد',
+      readCapture6().length === capsBeforeUnsubMsg,
+      `before=${capsBeforeUnsubMsg} after=${readCapture6().length}`);
+
+    // حدّ الاشتراكات: ٥ لكل مستخدم كحد أقصى مهما أُضيف
+    for (let n = 2; n <= 7; n++) {
+      await apiPush('/api/push/subscribe', { method: 'POST', token: tokPR, body: { subscription: fakeSub(n) } });
+    }
+    check('اشتراكات Push محدودة بـ ٥ لكل مستخدم', subsOf('push_receiver').length === 5,
+      `count=${subsOf('push_receiver').length}`);
+  } finally {
+    server6.kill();
+    fs.rmSync(dataDir6, { recursive: true, force: true });
   }
 
   B2.close();
